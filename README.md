@@ -72,12 +72,11 @@ The first time the portal opens a terminal window, macOS asks you to allow the a
 
 ## Briefings
 
-A briefing collects every session with a prompt in the chosen day, week or month. For each session it takes the prompts you sent and the agent's final reply to each, trims them to a size budget, and asks an LLM to group the work by category, project and task. Each task comes back with:
+A briefing collects every session with a prompt in the chosen day, week or month. For each session it takes the prompts you sent and the agent's final reply to each, trims them to a size budget, and asks an LLM to write the report in three parts:
 
-- its progress;
-- a short summary;
-- the outputs it produced;
-- the to-dos still open.
+- **Overview**: 3 to 5 points on the period's main areas of work and where each stands.
+- **Next steps**: the actions to take next, the highlights, and the risks.
+- **Priorities**: the full record, grouped by category, project and task and ordered by importance. Each task has its progress, a short summary, the outputs it produced, the to-dos still open, and the sessions it came from.
 
 Personal sessions are left out. Briefings are cached under `$XDG_CACHE_HOME/aitop/briefs/`, and the portal can copy them as Markdown.
 
