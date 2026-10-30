@@ -7,7 +7,7 @@ Claude Code and Codex each keep their sessions in their own stores, and every cl
 ## What it covers
 
 | Runtime | Source |
-|---|---|
+| --- | --- |
 | Claude Code in VSCode, the CLI, and the Claude Desktop Code tab | `$CLAUDE_CONFIG_DIR/projects/*/*.jsonl` transcripts, plus `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` for live status |
 | Claude Desktop session titles, archive flags and turn summaries | `~/Library/Application Support/Claude/claude-code-sessions/` (macOS) |
 | Codex app, CLI, IDE extension and Chrome side panel, across all model providers | `$CODEX_HOME/state_*.sqlite` plus rollout files |
@@ -62,7 +62,7 @@ aitop serve                  # web portal on http://127.0.0.1:8765/
 Each runtime has its own icon and color. Clicking a session title opens the session where it lives:
 
 | Runtime | How it opens |
-|---|---|
+| --- | --- |
 | VSCode | The extension's `vscode://anthropic.claude-code/open?session=<id>` handler |
 | Claude Desktop | `claude://code/continue?session=<id>` |
 | Codex | `codex://threads/<id>` |
@@ -101,7 +101,7 @@ Settings are optional and live in `$XDG_CONFIG_HOME/aitop/config.json`, which de
 These environment variables are honoured:
 
 | Variable | Used for | Default |
-|---|---|---|
+| --- | --- | --- |
 | `CLAUDE_CONFIG_DIR` | Claude Code data | `~/.claude` |
 | `CODEX_HOME` | Codex data | `~/.codex` |
 | `XDG_CONFIG_HOME` | the config file | `~/.config` |
