@@ -22,7 +22,6 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 import traceback
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -30,9 +29,11 @@ from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+__version__ = '0.1.0'
 HOME = os.path.expanduser('~')
 CLAUDE_DIR = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(HOME, '.claude')
-DESKTOP_DIR = os.path.join(HOME, 'Library/Application Support/Claude/claude-code-sessions')
+DESKTOP_DIR = (os.environ.get('AITOP_CLAUDE_DESKTOP_DIR')
+               or os.path.join(HOME, 'Library/Application Support/Claude/claude-code-sessions'))
 CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.join(HOME, '.codex')
 CONFIG_PATH = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(HOME, '.config'), 'aitop', 'config.json')
 STATE_DIR = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(HOME, '.local', 'state'), 'aitop')
@@ -57,7 +58,22 @@ def now_ms():
 
 
 def iso_ms(ts):
-    return int(datetime.fromisoformat(ts).timestamp() * 1000)
+    # Python before 3.11 rejects the trailing Z that both agents write.
+    return int(datetime.fromisoformat(ts[:-1] + '+00:00' if ts.endswith('Z') else ts).timestamp() * 1000)
+
+
+WARNED = set()
+
+
+def warn(msg):
+    """Report a skipped or unreadable file once per process on stderr."""
+    if msg not in WARNED:
+        WARNED.add(msg)
+        print(f'aitop: {msg}', file=sys.stderr, flush=True)
+
+
+def describe(error):
+    return f'{type(error).__name__}: {error}'[:300]
 
 
 def one_line(text):
@@ -201,10 +217,13 @@ def load_registry():
                 entry = json.load(f)
         except FileNotFoundError:
             continue  # process exited between glob and open
+        except ValueError as e:
+            warn(f'skipped live-session file {path}: {describe(e)}')
+            continue
         try:
             os.kill(entry['pid'], 0)
-        except ProcessLookupError:
-            continue
+        except (ProcessLookupError, PermissionError):
+            continue  # gone, or the pid now belongs to another user's process
         sid = entry['sessionId']
         if sid not in live or entry['updatedAt'] > live[sid]['updatedAt']:
             live[sid] = entry
@@ -214,10 +233,26 @@ def load_registry():
 def load_desktop():
     meta = {}
     for path in glob.glob(os.path.join(DESKTOP_DIR, '*', '*', 'local_*.json')):
-        with open(path) as f:
-            d = json.load(f)
-        meta[d.get('cliSessionId') or d['sessionId']] = d
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            meta[d.get('cliSessionId') or d['sessionId']] = d
+        except (ValueError, KeyError) as e:
+            warn(f'skipped Claude Desktop file {path}: {describe(e)}')
     return meta
+
+
+def unreadable_row(kind, sid, path, error, name=None, cwd='', runtime=None):
+    """A session whose files could not be parsed: listed with the error instead of failing every command."""
+    warn(f'could not read {kind} session {sid}: {describe(error)}')
+    mtime = int(os.path.getmtime(path) * 1000) if path and os.path.exists(path) else 0
+    return {
+        'key': f'{kind}:{sid}', 'id': sid, 'status': 'closed', 'detail': '', 'since': mtime, 'live': False,
+        'runtime': runtime or kind, 'name': name or sid[:8], 'brief': '',
+        'step': f'Could not read this session: {describe(error)}', 'last_active': mtime, 'created': mtime,
+        'cwd': cwd or '', 'focused': 0, 'reply': '', 'last_prompt': '', 'provider': None, 'pid': None,
+        'desktop_id': None, 'path': path, 'error': describe(error),
+    }
 
 
 def load_claude(cutoff, include_all, id_prefix):
@@ -242,50 +277,57 @@ def load_claude(cutoff, include_all, id_prefix):
             newest = max((dm or {}).get('lastActivityAt') or 0, int(os.path.getmtime(path) * 1000) if path else 0)
             if cutoff is not None and newest < cutoff:
                 continue
-
-        head = claude_head(path) if path else {'brief': '', 'entrypoint': None, 'cwd': None, 'created': None}
-        tail = claude_tail(path) if path else {'titles': {}, 'last_active': 0, 'step': '', 'reply': '',
-                                               'last_prompt': ''}
-        pts = (dm or {}).get('postTurnSummary') or {}
-        detail, since = '', None
-        if dm and dm.get('isArchived'):
-            status = 'archived'
-        elif reg:
-            status = CLAUDE_REG_STATUS.get(reg.get('status'))
-            if status is None:
-                raise ValueError(f"pid {reg['pid']}: unknown Claude session status {reg.get('status')!r}")
-            detail = reg.get('waitingFor') or ''
-            since = reg.get('statusUpdatedAt')
-        elif dm:
-            status = 'waiting' if pts.get('status_category') == 'blocked' else 'your-turn'
-            detail = pts.get('needs_action') or ''
-        else:
-            status = 'closed'
-
-        # A Desktop session resumed in VSCode runs in VSCode now, so the live process decides.
-        entrypoint = (reg or {}).get('entrypoint') or head['entrypoint'] or ('claude-desktop' if dm else None)
-        titles = tail['titles']
-        reg_name = (reg or {}).get('name')
-        name = (titles.get('custom')
-                or (reg_name if reg and reg.get('nameSource') != 'derived' else None)
-                or (dm or {}).get('title') or titles.get('agent') or titles.get('ai') or reg_name or sid[:8])
-        step = tail['step']
-        if dm and not reg and pts.get('status_detail') and dm.get('postTurnSummaryFor') == dm.get('lastAssistantUuid'):
-            step = pts['status_detail']
-        last_active = (tail['last_active'] or (dm or {}).get('lastActivityAt')
-                       or (reg or {}).get('updatedAt') or int(os.path.getmtime(path) * 1000))
-        rows.append({
-            'key': f'claude:{sid}', 'id': sid, 'status': status, 'detail': detail,
-            'since': since or last_active, 'live': bool(reg),
-            'runtime': CLAUDE_RUNTIME.get(entrypoint, entrypoint or 'claude'),
-            'name': name, 'brief': head['brief'], 'step': step, 'last_active': last_active,
-            'created': head['created'] or (dm or {}).get('createdAt') or (reg or {}).get('startedAt') or last_active,
-            'cwd': head['cwd'] or (reg or {}).get('cwd') or (dm or {}).get('cwd') or '',
-            'focused': (dm or {}).get('lastFocusedAt') or 0,
-            'reply': tail['reply'] or pts.get('status_detail') or '', 'last_prompt': tail['last_prompt'],
-            'provider': None, 'pid': (reg or {}).get('pid'), 'desktop_id': (dm or {}).get('sessionId'), 'path': path,
-        })
+        try:
+            rows.append(claude_row(sid, reg, dm, path))
+        except Exception as e:
+            rows.append(unreadable_row('claude', sid, path, e, name=(dm or {}).get('title') or (reg or {}).get('name'),
+                                       cwd=(reg or dm or {}).get('cwd', '')))
     return rows
+
+
+def claude_row(sid, reg, dm, path):
+    head = claude_head(path) if path else {'brief': '', 'entrypoint': None, 'cwd': None, 'created': None}
+    tail = claude_tail(path) if path else {'titles': {}, 'last_active': 0, 'step': '', 'reply': '', 'last_prompt': ''}
+    pts = (dm or {}).get('postTurnSummary') or {}
+    detail, since = '', None
+    if dm and dm.get('isArchived'):
+        status = 'archived'
+    elif reg:
+        status = CLAUDE_REG_STATUS.get(reg.get('status'))
+        if status is None:
+            raise ValueError(f"pid {reg['pid']}: unknown Claude session status {reg.get('status')!r}")
+        detail = reg.get('waitingFor') or ''
+        since = reg.get('statusUpdatedAt')
+    elif dm:
+        status = 'waiting' if pts.get('status_category') == 'blocked' else 'your-turn'
+        detail = pts.get('needs_action') or ''
+    else:
+        status = 'closed'
+
+    # A Desktop session resumed in VSCode runs in VSCode now, so the live process decides.
+    entrypoint = (reg or {}).get('entrypoint') or head['entrypoint'] or ('claude-desktop' if dm else None)
+    titles = tail['titles']
+    reg_name = (reg or {}).get('name')
+    name = (titles.get('custom')
+            or (reg_name if reg and reg.get('nameSource') != 'derived' else None)
+            or (dm or {}).get('title') or titles.get('agent') or titles.get('ai') or reg_name or sid[:8])
+    step = tail['step']
+    if dm and not reg and pts.get('status_detail') and dm.get('postTurnSummaryFor') == dm.get('lastAssistantUuid'):
+        step = pts['status_detail']
+    last_active = (tail['last_active'] or (dm or {}).get('lastActivityAt')
+                   or (reg or {}).get('updatedAt') or int(os.path.getmtime(path) * 1000))
+    return {
+        'key': f'claude:{sid}', 'id': sid, 'status': status, 'detail': detail,
+        'since': since or last_active, 'live': bool(reg),
+        'runtime': CLAUDE_RUNTIME.get(entrypoint, entrypoint or 'claude'),
+        'name': name, 'brief': head['brief'], 'step': step, 'last_active': last_active,
+        'created': head['created'] or (dm or {}).get('createdAt') or (reg or {}).get('startedAt') or last_active,
+        'cwd': head['cwd'] or (reg or {}).get('cwd') or (dm or {}).get('cwd') or '',
+        'focused': (dm or {}).get('lastFocusedAt') or 0,
+        'reply': tail['reply'] or pts.get('status_detail') or '', 'last_prompt': tail['last_prompt'],
+        'provider': None, 'pid': (reg or {}).get('pid'), 'desktop_id': (dm or {}).get('sessionId'), 'path': path,
+        'error': None,
+    }
 
 
 # ---------------------------------------------------------------- Codex
@@ -369,22 +411,40 @@ def codex_db():
 
 @cache
 def codex_config():
+    """The two Codex settings aitop needs: the default provider and provider display names.
+
+    Read line by line instead of with tomllib so aitop runs on Python 3.9, which ships without it.
+    """
+    cfg = {'model_provider': 'openai', 'names': {}}  # openai is Codex's own default provider
     path = os.path.join(CODEX_DIR, 'config.toml')
     if not os.path.exists(path):
-        return {}
-    with open(path, 'rb') as f:
-        return tomllib.load(f)
+        return cfg
+    table = ''
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('['):
+                table = line.strip('[] ')
+                continue
+            m = re.match(r'([A-Za-z0-9_-]+)\s*=\s*(["\'])(.*?)\2', line)
+            if not m:
+                continue
+            if table == '' and m.group(1) == 'model_provider':
+                cfg['model_provider'] = m.group(3)
+            elif table.startswith('model_providers.') and m.group(1) == 'name':
+                cfg['names'][table.split('.', 1)[1].strip('"\'')] = m.group(3)
+    return cfg
 
 
 def codex_default_provider():
-    return codex_config().get('model_provider', 'openai')  # Codex's own default when none is configured
+    return codex_config()['model_provider']
 
 
 def codex_provider_label(provider):
     """Display name for a model provider id, taken from the user's own Codex config."""
     if provider == 'openai':
         return 'built-in'
-    return codex_config().get('model_providers', {}).get(provider, {}).get('name') or provider
+    return codex_config()['names'].get(provider) or provider
 
 
 def load_codex(cutoff, include_all, id_prefix):
@@ -410,7 +470,12 @@ def load_codex(cutoff, include_all, id_prefix):
     rows = []
     for (tid, rollout, updated, created, source, originator, provider, cwd, title, first_msg,
          archived) in con.execute(sql, params):
-        tail = codex_tail(rollout)
+        runtime = codex_runtime(source, originator, provider)
+        try:
+            tail = codex_tail(rollout)
+        except Exception as e:
+            rows.append(unreadable_row('codex', tid, rollout, e, name=codex_request(title), cwd=cwd, runtime=runtime))
+            continue
         if archived:
             status = 'archived'
         elif tail['running'] and now_ms() - os.path.getmtime(rollout) * 1000 < CODEX_STALE_MS:
@@ -419,11 +484,11 @@ def load_codex(cutoff, include_all, id_prefix):
             status = 'your-turn'
         rows.append({
             'key': f'codex:{tid}', 'id': tid, 'status': status, 'detail': '', 'since': updated,
-            'live': status == 'running', 'runtime': codex_runtime(source, originator, provider),
+            'live': status == 'running', 'runtime': runtime,
             'name': codex_request(title), 'brief': codex_request(first_msg), 'step': tail['step'],
             'last_active': updated, 'created': created, 'cwd': cwd, 'focused': 0, 'reply': tail['reply'],
             'last_prompt': tail['last_prompt'], 'provider': provider, 'pid': None, 'desktop_id': None,
-            'path': rollout,
+            'path': rollout, 'error': None,
         })
     con.close()
     return rows
@@ -868,9 +933,17 @@ def load_usage():
                     if not line.endswith(b'\n'):
                         break  # the agent is still writing this record
                     e['offset'] += len(line)
-                    (index_claude_line if kind == 'claude' else index_codex_line)(e, line)
+                    try:
+                        (index_claude_line if kind == 'claude' else index_codex_line)(e, line)
+                    except Exception as err:
+                        # A damaged record costs that record, not the whole index; Insights reports the count.
+                        e['bad'] = e.get('bad', 0) + 1
+                        e.setdefault('bad_msg', describe(err))
         except FileNotFoundError:
             continue  # deleted between glob and read
+        except OSError as err:
+            warn(f'skipped {path}: {describe(err)}')
+            continue
         changed = True
     if changed:
         os.makedirs(os.path.dirname(USAGE_CACHE), exist_ok=True)
@@ -886,8 +959,12 @@ def claude_archive_days():
     path = os.path.join(CLAUDE_DIR, 'stats-cache.json')
     if not os.path.exists(path):
         return {}
-    with open(path) as f:
-        return {a['date']: a['sessionCount'] for a in json.load(f).get('dailyActivity', [])}
+    try:
+        with open(path) as f:
+            return {a['date']: a['sessionCount'] for a in json.load(f).get('dailyActivity', [])}
+    except (ValueError, KeyError, TypeError) as e:
+        warn(f'skipped {path}: {describe(e)}')
+        return {}
 
 
 def stats(range_key):
@@ -1028,7 +1105,8 @@ def stats(range_key):
         'prs': [{'ts': ts, 'url': url, 'repo': repo, 'number': number}
                 for ts, url, repo, number in pr_list if period(as_date(ts)) == 0][:12],
         'archive_until': claude_first.isoformat() if archive else None,
-        'indexed': {'files': len(files), 'bytes': sum(e['offset'] for e in files.values())},
+        'indexed': {'files': len(files), 'bytes': sum(e['offset'] for e in files.values()),
+                    'unreadable_records': sum(e.get('bad', 0) for e in files.values())},
     }
 
 
@@ -1190,21 +1268,27 @@ def active_entries(t0, t1):
 
 
 def brief_sessions(start, end):
+    """(sessions with turns in the period, names of sessions that could not be read)."""
     t0, t1 = local_ts(start), local_ts(end)
     rows = {r['id']: r for r in collect(None, include_all=True)}
-    sessions = []
+    sessions, unreadable = [], []
     for sid, (path, e) in active_entries(t0, t1).items():
-        turns = (claude_turns if e['kind'] == 'claude' else codex_turns)(path, t0, t1)
+        r = rows.get(sid, {})
+        try:
+            turns = (claude_turns if e['kind'] == 'claude' else codex_turns)(path, t0, t1)
+        except Exception as err:
+            warn(f'left session {sid} out of the briefing: {describe(err)}')
+            unreadable.append(r.get('name') or sid[:8])
+            continue
         if not turns:
             continue
-        r = rows.get(sid, {})
         sessions.append({
             'id': sid, 'name': r.get('name') or sid[:8], 'runtime': r.get('runtime') or e['runtime'] or e['kind'],
             'status': r.get('status', 'closed'), 'cwd': e['cwd'] or r.get('cwd', ''), 'opened_with': r.get('brief', ''),
             'turns': turns, 'edits': sorted(p for p, ts in e['edits'].items() if t0 <= ts < t1),
             'prs': sorted({url for ts, url, *_ in e.get('prs', []) if t0 <= ts < t1}),
         })
-    return sorted(sessions, key=lambda s: s['turns'][0][0])
+    return sorted(sessions, key=lambda s: s['turns'][0][0]), unreadable
 
 
 def brief_digest(sessions, budget):
@@ -1272,7 +1356,7 @@ def brief_path(kind, start):
 def generate_brief(kind, day):
     cfg = load_config()['brief']
     start, end, label = brief_period(kind, day)
-    sessions = brief_sessions(start, end)
+    sessions, unreadable = brief_sessions(start, end)
     if not sessions:
         raise NotFound(f'No session had a prompt in {label}.')
     digest = brief_digest(sessions, cfg['digest_chars'])
@@ -1286,7 +1370,7 @@ def generate_brief(kind, day):
         'sessions': {s['id'][:8]: {'id': s['id'], 'name': s['name'], 'runtime': s['runtime']} for s in sessions},
         'stats': {'sessions': len(sessions), 'prompts': sum(len(s['turns']) for s in sessions),
                   'edits': len({p for s in sessions for p in s['edits']}), 'prs': len({u for s in sessions for u in s['prs']})},
-        'report': report,
+        'report': report, 'unreadable': unreadable,
     }
     os.makedirs(BRIEF_DIR, exist_ok=True)
     tmp = brief_path(kind, start) + '.tmp'
@@ -1316,6 +1400,8 @@ def brief_markdown(brief):
                     lines.append('  - Outputs: ' + '; '.join(t['outputs']))
                 if t.get('todos'):
                     lines.append('  - To do: ' + '; '.join(t['todos']))
+    if brief.get('unreadable'):
+        lines += ['', f'Left out because they could not be read: {", ".join(brief["unreadable"])}.']
     return '\n'.join(lines).strip() + '\n'
 
 
@@ -1372,7 +1458,7 @@ def cmd_brief(args):
 
 def to_json(r, full=False):
     out = {k: r[k] for k in ('id', 'status', 'detail', 'since', 'live', 'runtime', 'name', 'last_active', 'created',
-                             'cwd')}
+                             'cwd', 'error')}
     out.update(brief=r['brief'][:400], step=r['step'][:300], where=short_cwd(r['cwd']))
     if full:
         out.update(reply=r['reply'], last_prompt=r['last_prompt'], resume=resume_hint(r), resume_cmd=resume_cmd(r))
@@ -1648,6 +1734,7 @@ button, input, select { font: inherit; color: inherit; }
 .cell-session > div { min-width: 0; }
 .sub { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-step { color: var(--ink-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-step.err { color: var(--st-waiting); }
 .cell-proj { min-width: 0; font-size: 13px; }
 .cell-proj > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-time { text-align: right; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -1948,7 +2035,8 @@ const rtKey = runtime => { const k = (runtime || '').split('/')[0]; return RT[k]
 const rtProvider = runtime => (runtime || '').split('/')[1] || '';
 const rtLabel = runtime => RT[rtKey(runtime)][0] + (rtProvider(runtime) ? `, ${rtProvider(runtime)}` : '');
 const compact = v => new Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1}).format(v);
-const fmtBytes = b => b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB` : `${Math.round(b / 2 ** 20)} MB`;
+const fmtBytes = b => b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB` : b >= 2 ** 20 ? `${Math.round(b / 2 ** 20)} MB`
+  : `${Math.max(1, Math.round(b / 2 ** 10))} KB`;
 const when = ms => new Date(ms).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
 const fmtDay = iso => new Date(iso + 'T00:00').toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
 const project = cwd => (cwd || '').split('/').filter(Boolean).pop() || '';
@@ -2063,7 +2151,7 @@ function sessionRow(r) {
   return h('div', {class: 'tr', tabindex: '0', onclick: open, onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) open(); }},
     h('div', {class: 'cell-session'}, tile(r.runtime), h('div', {}, titleLink(r), h('div', {class: 'sub'}, r.brief || 'No prompt yet'))),
     h('div', {}, statusPill(r)),
-    h('div', {class: 'cell-step', title: r.step}, r.step || '—'),
+    h('div', {class: 'cell-step' + (r.error ? ' err' : ''), title: r.step}, r.step || '—'),
     h('div', {class: 'cell-proj', title: r.cwd}, h('div', {}, project(r.cwd)), h('div', {class: 'sub'}, rtLabel(r.runtime))),
     h('div', {class: 'cell-time', title: 'Last active ' + when(r.last_active)}, ago(r.last_active)));
 }
@@ -2290,7 +2378,8 @@ function renderInsights(s) {
       seg([['7d', '7 days'], ['30d', '30 days'], ['90d', '90 days'], ['all', 'All time']], s.range,
         v => { state.range = v; load(); }),
       h('span', {class: 'spacer'}),
-      h('span', {class: 'muted small'}, `${s.indexed.files} transcripts indexed, ${fmtBytes(s.indexed.bytes)}`)),
+      h('span', {class: 'muted small'}, `${s.indexed.files} transcripts indexed, ${fmtBytes(s.indexed.bytes)}` +
+        (s.indexed.unreadable_records ? `, ${s.indexed.unreadable_records} damaged records skipped` : ''))),
     kpiStrip(s),
     h('section', {class: 'panel'},
       h('div', {class: 'panel-head'}, h('h3', {}, 'Sessions started'), h('p', {}, `New sessions ${per}, by runtime`)),
@@ -2384,7 +2473,9 @@ function briefBody(b) {
       h('div', {class: 'cat-head'}, h('h3', {}, c.name), h('span', {class: 'n'}, String(c.projects.reduce((a, p) => a + p.tasks.length, 0)))),
       h('div', {class: 'brief-panel'}, c.projects.map(p => h('div', {class: 'proj'}, h('h4', {}, p.name), p.tasks.map(t => taskRow(b, t))))))),
     (r.skipped || []).length > 0 && h('p', {class: 'foot-note'},
-      `${r.skipped.length} personal ${r.skipped.length === 1 ? 'session was' : 'sessions were'} left out.`)];
+      `${r.skipped.length} personal ${r.skipped.length === 1 ? 'session was' : 'sessions were'} left out.`),
+    (b.unreadable || []).length > 0 && h('p', {class: 'foot-note'},
+      `Left out because they could not be read: ${b.unreadable.join(', ')}.`)];
 }
 async function writeBrief(st) {
   await api('/api/brief', {kind: st.kind, date: st.start});
@@ -2494,6 +2585,7 @@ go(VIEWS.includes(initial) ? initial : 'inbox');
 
 def main():
     ap = argparse.ArgumentParser(prog='aitop', description=__doc__.split('\n')[0])
+    ap.add_argument('--version', action='version', version=f'aitop {__version__}')
     sub = ap.add_subparsers(dest='cmd')
     p_list = sub.add_parser('list', help='table of sessions (default command)')
     p_list.add_argument('--all', action='store_true', help='include closed and archived sessions')
@@ -2519,7 +2611,7 @@ def main():
     commands = {'list': cmd_list, 'catchup': cmd_catchup, 'week': cmd_week, 'show': cmd_show,
                 'ack': cmd_ack, 'serve': cmd_serve, 'brief': cmd_brief}
     argv = sys.argv[1:]
-    if not argv or argv[0] not in (*commands, '-h', '--help'):
+    if not argv or argv[0] not in (*commands, '-h', '--help', '--version'):
         argv = ['list'] + argv
     args = ap.parse_args(argv)
     try:
