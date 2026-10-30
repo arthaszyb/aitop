@@ -1,0 +1,2491 @@
+#!/usr/bin/env python3
+"""aitop: one view of every local AI agent session and which ones are waiting on you.
+
+Sources (read-only):
+  $CLAUDE_CONFIG_DIR/projects/*/*.jsonl   Claude Code transcripts (CLI, VSCode, Desktop Code tab)
+  $CLAUDE_CONFIG_DIR/sessions/<pid>.json  live Claude processes with busy/idle/waiting status
+  ~/Library/Application Support/Claude/claude-code-sessions/   Desktop titles, archive flag, turn summaries (macOS)
+  $CODEX_HOME/state_*.sqlite + rollouts   Codex threads from every model provider
+
+aitop writes only its own state: read marks, a usage index and generated briefings (see STATE_DIR, CACHE_DIR).
+Briefings send a digest of your sessions to the LLM command in the config file; nothing else leaves the machine.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import traceback
+import unicodedata
+from datetime import date, datetime, timedelta
+from functools import cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+HOME = os.path.expanduser('~')
+CLAUDE_DIR = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(HOME, '.claude')
+DESKTOP_DIR = os.path.join(HOME, 'Library/Application Support/Claude/claude-code-sessions')
+CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.join(HOME, '.codex')
+CONFIG_PATH = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(HOME, '.config'), 'aitop', 'config.json')
+STATE_DIR = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(HOME, '.local', 'state'), 'aitop')
+CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'), 'aitop')
+SEEN_PATH = os.path.join(STATE_DIR, 'seen.json')
+OPENER = 'open' if sys.platform == 'darwin' else 'xdg-open'
+
+STATUS_ORDER = {'waiting': 0, 'running': 1, 'your-turn': 2, 'closed': 3, 'archived': 4}
+STATUS_COLOR = {'waiting': '1;31', 'running': '33', 'your-turn': '32', 'closed': '2', 'archived': '2'}
+CLAUDE_RUNTIME = {'claude-vscode': 'vscode', 'cli': 'claude-cli', 'claude-desktop': 'claude-code'}
+CLAUDE_REG_STATUS = {'busy': 'running', 'waiting': 'waiting', 'idle': 'your-turn'}
+# A Codex turn with no completion event and no rollout write for this long is treated as dead.
+CODEX_STALE_MS = 10 * 60 * 1000
+# Wrappers the IDE / harness injects into user turns; they are not what the user asked.
+NOISE_TAGS = re.compile(
+    r'<(ide_[a-z_]+|system-reminder|command-[a-z-]+|local-command-[a-z-]+|environment_context)\b[^>]*>.*?</\1>',
+    re.S)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def iso_ms(ts):
+    return int(datetime.fromisoformat(ts).timestamp() * 1000)
+
+
+def one_line(text):
+    return ' '.join(text.split())
+
+
+def first_line(text):
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return ''
+
+
+def parse_since(value):
+    m = re.fullmatch(r'(\d+)([mhd])', value)
+    if not m:
+        raise argparse.ArgumentTypeError(f'expected e.g. 30m, 12h, 7d; got {value!r}')
+    return int(m.group(1)) * {'m': 60, 'h': 3600, 'd': 86400}[m.group(2)] * 1000
+
+
+def read_tail(path, nbytes):
+    """Parse the JSONL records in the last nbytes of path."""
+    size = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        f.seek(max(0, size - nbytes))
+        lines = f.read().split(b'\n')
+    if size > nbytes:
+        lines = lines[1:]  # cut mid-record by the seek
+    records = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            if i == len(lines) - 1:
+                continue  # the agent is still writing this record
+            raise ValueError(f'{path}: unparseable JSONL record: {e}') from e
+    return records
+
+
+def read_tail_until(path, has_enough, start=512 * 1024, limit=8 * 1024 * 1024):
+    size = os.path.getsize(path)
+    n = start
+    while True:
+        records = read_tail(path, n)
+        if has_enough(records) or n >= size or n >= limit:
+            return records
+        n *= 2
+
+
+# ---------------------------------------------------------------- Claude
+
+def claude_text(content):
+    if isinstance(content, str):
+        return content
+    return '\n'.join(b.get('text', '') for b in content if b.get('type') == 'text')
+
+
+def claude_prompt(rec):
+    """The human prompt in a user record, or '' for tool results, meta and injected records."""
+    if rec.get('type') != 'user' or rec.get('isMeta') or rec.get('isSidechain'):
+        return ''
+    content = rec['message'].get('content')
+    if isinstance(content, list) and any(b.get('type') == 'tool_result' for b in content):
+        return ''
+    text = NOISE_TAGS.sub('', claude_text(content or ''))
+    text = re.sub(r'</?pasted_content[^>]*>', '', text).strip()
+    if text.startswith('Caveat:') or text.startswith('[Request interrupted'):
+        return ''
+    return text
+
+
+def claude_step(rec):
+    for block in reversed(rec['message'].get('content') or []):
+        if block.get('type') == 'tool_use':
+            inp = block.get('input') or {}
+            arg = next((inp[k] for k in ('description', 'command', 'file_path', 'pattern', 'query',
+                                         'url', 'skill', 'prompt')
+                        if isinstance(inp.get(k), str) and inp[k].strip()), '')
+            return f"{block['name']}: {first_line(arg)}" if arg else block['name']
+        if block.get('type') == 'text' and block['text'].strip():
+            return first_line(block['text'])
+    return ''
+
+
+def claude_head(path):
+    """First human prompt plus entrypoint/cwd/creation time, reading at most 2MB from the start."""
+    info = {'brief': '', 'entrypoint': None, 'cwd': None, 'created': None}
+    read = 0
+    with open(path, 'rb') as f:
+        for raw in f:
+            read += len(raw)
+            if read > 2 * 1024 * 1024:
+                break
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                break  # only possible on the last line of a file still being written
+            info['entrypoint'] = info['entrypoint'] or rec.get('entrypoint')
+            info['cwd'] = info['cwd'] or rec.get('cwd')
+            if info['created'] is None and rec.get('timestamp'):
+                info['created'] = iso_ms(rec['timestamp'])
+            prompt = claude_prompt(rec)
+            if prompt:
+                info['brief'] = prompt
+                break
+    return info
+
+
+def claude_tail(path):
+    records = read_tail_until(path, lambda rs: any(r.get('type') == 'assistant' for r in rs))
+    info = {'titles': {}, 'last_active': 0, 'step': '', 'reply': '', 'last_prompt': ''}
+    for rec in records:
+        t = rec.get('type')
+        if t == 'custom-title':
+            info['titles']['custom'] = rec['customTitle']
+        elif t == 'agent-name':
+            info['titles']['agent'] = rec['agentName']
+        elif t == 'ai-title':
+            info['titles']['ai'] = rec['aiTitle']
+        elif t == 'last-prompt' and rec.get('lastPrompt'):  # some carry only leafUuid
+            info['last_prompt'] = rec['lastPrompt']
+        elif t in ('user', 'assistant') and not rec.get('isSidechain'):
+            info['last_active'] = max(info['last_active'], iso_ms(rec['timestamp']))
+            if t == 'assistant':
+                info['step'] = claude_step(rec) or info['step']
+                text = claude_text(rec['message'].get('content') or [])
+                if text.strip():
+                    info['reply'] = text.strip()
+            elif not info['last_prompt'] and claude_prompt(rec):
+                info['last_prompt'] = claude_prompt(rec)
+    return info
+
+
+def load_registry():
+    live = {}
+    for path in glob.glob(os.path.join(CLAUDE_DIR, 'sessions', '*.json')):
+        try:
+            with open(path) as f:
+                entry = json.load(f)
+        except FileNotFoundError:
+            continue  # process exited between glob and open
+        try:
+            os.kill(entry['pid'], 0)
+        except ProcessLookupError:
+            continue
+        sid = entry['sessionId']
+        if sid not in live or entry['updatedAt'] > live[sid]['updatedAt']:
+            live[sid] = entry
+    return live
+
+
+def load_desktop():
+    meta = {}
+    for path in glob.glob(os.path.join(DESKTOP_DIR, '*', '*', 'local_*.json')):
+        with open(path) as f:
+            d = json.load(f)
+        meta[d.get('cliSessionId') or d['sessionId']] = d
+    return meta
+
+
+def load_claude(cutoff, include_all, id_prefix):
+    registry = load_registry()
+    desktop = load_desktop()
+    transcripts = {}
+    for path in glob.glob(os.path.join(CLAUDE_DIR, 'projects', '*', '*.jsonl')):
+        sid = os.path.basename(path)[:-len('.jsonl')]
+        if sid not in transcripts or os.path.getmtime(path) > os.path.getmtime(transcripts[sid]):
+            transcripts[sid] = path
+
+    rows = []
+    for sid in set(transcripts) | set(desktop) | set(registry):
+        if id_prefix and not sid.startswith(id_prefix):
+            continue
+        reg, dm, path = registry.get(sid), desktop.get(sid), transcripts.get(sid)
+        if not id_prefix and not reg:
+            # Without a live process only Desktop sessions can be anything but closed/archived.
+            if not include_all and (not dm or dm.get('isArchived')):
+                continue
+            # Activity is appended to the transcript, so an mtime before the cutoff rules it out unread.
+            newest = max((dm or {}).get('lastActivityAt') or 0, int(os.path.getmtime(path) * 1000) if path else 0)
+            if cutoff is not None and newest < cutoff:
+                continue
+
+        head = claude_head(path) if path else {'brief': '', 'entrypoint': None, 'cwd': None, 'created': None}
+        tail = claude_tail(path) if path else {'titles': {}, 'last_active': 0, 'step': '', 'reply': '',
+                                               'last_prompt': ''}
+        pts = (dm or {}).get('postTurnSummary') or {}
+        detail, since = '', None
+        if dm and dm.get('isArchived'):
+            status = 'archived'
+        elif reg:
+            status = CLAUDE_REG_STATUS.get(reg.get('status'))
+            if status is None:
+                raise ValueError(f"pid {reg['pid']}: unknown Claude session status {reg.get('status')!r}")
+            detail = reg.get('waitingFor') or ''
+            since = reg.get('statusUpdatedAt')
+        elif dm:
+            status = 'waiting' if pts.get('status_category') == 'blocked' else 'your-turn'
+            detail = pts.get('needs_action') or ''
+        else:
+            status = 'closed'
+
+        # A Desktop session resumed in VSCode runs in VSCode now, so the live process decides.
+        entrypoint = (reg or {}).get('entrypoint') or head['entrypoint'] or ('claude-desktop' if dm else None)
+        titles = tail['titles']
+        reg_name = (reg or {}).get('name')
+        name = (titles.get('custom')
+                or (reg_name if reg and reg.get('nameSource') != 'derived' else None)
+                or (dm or {}).get('title') or titles.get('agent') or titles.get('ai') or reg_name or sid[:8])
+        step = tail['step']
+        if dm and not reg and pts.get('status_detail') and dm.get('postTurnSummaryFor') == dm.get('lastAssistantUuid'):
+            step = pts['status_detail']
+        last_active = (tail['last_active'] or (dm or {}).get('lastActivityAt')
+                       or (reg or {}).get('updatedAt') or int(os.path.getmtime(path) * 1000))
+        rows.append({
+            'key': f'claude:{sid}', 'id': sid, 'status': status, 'detail': detail,
+            'since': since or last_active, 'live': bool(reg),
+            'runtime': CLAUDE_RUNTIME.get(entrypoint, entrypoint or 'claude'),
+            'name': name, 'brief': head['brief'], 'step': step, 'last_active': last_active,
+            'created': head['created'] or (dm or {}).get('createdAt') or (reg or {}).get('startedAt') or last_active,
+            'cwd': head['cwd'] or (reg or {}).get('cwd') or (dm or {}).get('cwd') or '',
+            'focused': (dm or {}).get('lastFocusedAt') or 0,
+            'reply': tail['reply'] or pts.get('status_detail') or '', 'last_prompt': tail['last_prompt'],
+            'provider': None, 'pid': (reg or {}).get('pid'), 'desktop_id': (dm or {}).get('sessionId'), 'path': path,
+        })
+    return rows
+
+
+# ---------------------------------------------------------------- Codex
+
+def codex_request(text):
+    """Codex desktop prefixes prompts with attached-file headers; keep only the request."""
+    parts = re.split(r'^## My request[^:\n]*:', text, maxsplit=1, flags=re.M)
+    return parts[-1].strip()
+
+
+def codex_runtime(source, originator, provider):
+    if originator in ('Codex Desktop', 'codex_work_desktop'):
+        rt = 'codex-app'
+    elif originator == 'codex-chrome-extension-sidepanel':
+        rt = 'codex-chrome'
+    elif source == 'cli':
+        rt = 'codex-cli'
+    else:
+        rt = 'codex'
+    return f'{rt}/{codex_provider_label(provider)}'
+
+
+def codex_step(payload):
+    name = payload.get('name') or payload['type']
+    if payload['type'] == 'function_call':
+        args = json.loads(payload.get('arguments') or '{}')
+        detail = ''
+        if isinstance(args, dict):
+            for k in ('title', 'description', 'cmd', 'command', 'path', 'query', 'url'):
+                v = args.get(k)
+                if isinstance(v, list):
+                    v = ' '.join(map(str, v))
+                if isinstance(v, str) and v.strip():
+                    detail = v
+                    break
+    else:  # custom_tool_call: free-form input, usually JS around tools.exec_command({cmd:"..."})
+        inp = payload.get('input') or ''
+        m = re.search(r'cmd:\s*"((?:[^"\\]|\\.)*)"', inp)
+        detail = m.group(1) if m else inp
+    return f'{name}: {first_line(detail)}' if detail.strip() else name
+
+
+def codex_tail(path):
+    info = {'running': False, 'step': '', 'reply': '', 'last_prompt': ''}
+    if not os.path.exists(path):
+        info['step'] = '(rollout file missing)'
+        return info
+    records = read_tail_until(path, lambda rs: any(r.get('type') in ('response_item', 'event_msg') for r in rs),
+                              start=256 * 1024)
+    for rec in records:
+        p = rec.get('payload') or {}
+        t = p.get('type')
+        if rec.get('type') == 'event_msg':
+            if t == 'task_started':
+                info['running'] = True
+            elif t == 'task_complete':
+                info['running'] = False
+                if p.get('last_agent_message'):
+                    info['reply'] = p['last_agent_message']
+            elif t == 'turn_aborted':
+                info['running'] = False
+                info['step'] = 'turn aborted'
+        elif rec.get('type') == 'response_item':
+            if t in ('function_call', 'custom_tool_call'):
+                info['step'] = codex_step(p)
+            elif t == 'message' and p.get('role') in ('assistant', 'user'):
+                text = '\n'.join(c.get('text', '') for c in p.get('content') or [] if 'text' in c).strip()
+                if p['role'] == 'assistant' and text:
+                    info['step'] = first_line(text)
+                    info['reply'] = text
+                elif p['role'] == 'user' and text and not text.startswith('<'):
+                    info['last_prompt'] = codex_request(text)
+    return info
+
+
+def codex_db():
+    dbs = sorted(glob.glob(os.path.join(CODEX_DIR, 'state_*.sqlite')),
+                 key=lambda p: int(re.search(r'state_(\d+)', p).group(1)))
+    return dbs[-1] if dbs else None
+
+
+@cache
+def codex_config():
+    path = os.path.join(CODEX_DIR, 'config.toml')
+    if not os.path.exists(path):
+        return {}
+    with open(path, 'rb') as f:
+        return tomllib.load(f)
+
+
+def codex_default_provider():
+    return codex_config().get('model_provider', 'openai')  # Codex's own default when none is configured
+
+
+def codex_provider_label(provider):
+    """Display name for a model provider id, taken from the user's own Codex config."""
+    if provider == 'openai':
+        return 'built-in'
+    return codex_config().get('model_providers', {}).get(provider, {}).get('name') or provider
+
+
+def load_codex(cutoff, include_all, id_prefix):
+    db = codex_db()
+    if not db:
+        return []
+    con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+    sql = """select id, rollout_path, coalesce(updated_at_ms, updated_at * 1000),
+                    coalesce(created_at_ms, created_at * 1000), source, coalesce(originator, ''),
+                    model_provider, cwd, coalesce(nullif(name, ''), title), first_user_message, archived
+             from threads
+             where coalesce(thread_source, '') != 'guardian_review' and source not like '{"subagent"%'"""
+    params = []
+    if id_prefix:
+        sql += ' and id like ?'
+        params.append(id_prefix + '%')
+    else:
+        if not include_all:
+            sql += ' and archived = 0'
+        if cutoff is not None:
+            sql += ' and coalesce(updated_at_ms, updated_at * 1000) >= ?'
+            params.append(cutoff)
+    rows = []
+    for (tid, rollout, updated, created, source, originator, provider, cwd, title, first_msg,
+         archived) in con.execute(sql, params):
+        tail = codex_tail(rollout)
+        if archived:
+            status = 'archived'
+        elif tail['running'] and now_ms() - os.path.getmtime(rollout) * 1000 < CODEX_STALE_MS:
+            status = 'running'
+        else:
+            status = 'your-turn'
+        rows.append({
+            'key': f'codex:{tid}', 'id': tid, 'status': status, 'detail': '', 'since': updated,
+            'live': status == 'running', 'runtime': codex_runtime(source, originator, provider),
+            'name': codex_request(title), 'brief': codex_request(first_msg), 'step': tail['step'],
+            'last_active': updated, 'created': created, 'cwd': cwd, 'focused': 0, 'reply': tail['reply'],
+            'last_prompt': tail['last_prompt'], 'provider': provider, 'pid': None, 'desktop_id': None,
+            'path': rollout,
+        })
+    con.close()
+    return rows
+
+
+# ---------------------------------------------------------------- output
+
+def collect(since_ms, include_all=False, id_prefix=None):
+    """since_ms=None means no activity window."""
+    cutoff = None if since_ms is None else now_ms() - since_ms
+    rows = load_claude(cutoff, include_all, id_prefix) + load_codex(cutoff, include_all, id_prefix)
+    if not id_prefix and not include_all:
+        rows = [r for r in rows if r['status'] in ('waiting', 'running', 'your-turn')
+                and (r['live'] or cutoff is None or r['last_active'] >= cutoff)]
+    elif not id_prefix and cutoff is not None:
+        rows = [r for r in rows if r['last_active'] >= cutoff]
+    return sorted(rows, key=lambda r: (STATUS_ORDER[r['status']], -r['last_active']))
+
+
+def char_width(c):
+    if unicodedata.category(c) in ('Mn', 'Me', 'Cf'):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+
+
+def fit(text, width):
+    text = one_line(text)
+    out, used = [], 0
+    for c in text:
+        w = char_width(c)
+        if used + w > width:
+            while out and used + 1 > width:  # make room for the ellipsis
+                used -= char_width(out.pop())
+            out.append('…')
+            used += 1
+            break
+        out.append(c)
+        used += w
+    return ''.join(out) + ' ' * (width - used)
+
+
+def ago(ms):
+    s = max(0, (now_ms() - ms) // 1000)
+    for unit, n in (('d', 86400), ('h', 3600), ('m', 60)):
+        if s >= n:
+            return f'{s // n}{unit}'
+    return f'{s}s'
+
+
+def paint(text, status):
+    if not sys.stdout.isatty() or os.environ.get('NO_COLOR'):
+        return text
+    return f'\033[{STATUS_COLOR[status]}m{text}\033[0m'
+
+
+def short_cwd(cwd):
+    return '~' + cwd[len(HOME):] if cwd.startswith(HOME) else cwd
+
+
+def render_table(rows):
+    if not rows:
+        print('no sessions match')
+        return
+    cols = shutil.get_terminal_size((200, 40)).columns
+    rt_w = max(len('RUNTIME'), *(len(r['runtime']) for r in rows))
+    proj_w = min(18, max(len('PROJECT'), *(len(os.path.basename(r['cwd'])) for r in rows)))
+    fixed = 8 + 9 + rt_w + 6 + proj_w + 7 * 2  # id, status, runtime, active, project + gaps
+    flex = max(30, cols - fixed)
+    name_w, brief_w = flex * 3 // 10, flex * 35 // 100
+    step_w = flex - name_w - brief_w
+    widths = [8, 9, rt_w, name_w, brief_w, step_w, 6, proj_w]
+    header = ['ID', 'STATUS', 'RUNTIME', 'NAME', 'BRIEF', 'LATEST STEP', 'ACTIVE', 'PROJECT']
+    print('  '.join(fit(h, w) for h, w in zip(header, widths)).rstrip())
+    for r in rows:
+        cells = [r['id'][:8], r['status'], r['runtime'], r['name'], r['brief'], r['step'],
+                 ago(r['last_active']), os.path.basename(r['cwd'])]
+        out = [fit(c, w) for c, w in zip(cells, widths)]
+        out[1] = paint(out[1], r['status'])
+        print('  '.join(out).rstrip())
+    counts = {}
+    for r in rows:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    print('\n' + ' · '.join(f'{n} {s}' for s, n in sorted(counts.items(), key=lambda kv: STATUS_ORDER[kv[0]])))
+
+
+def resume_cmd(r):
+    """Shell command that reopens the session in a terminal; works for every runtime."""
+    cd = f'cd {shlex.quote(r["cwd"])} && '
+    if r['runtime'].startswith('codex'):
+        provider = f' -c model_provider={r["provider"]}' if r['provider'] != codex_default_provider() else ''
+        return f'{cd}codex resume{provider} {r["id"]}'
+    return f'{cd}claude --resume {r["id"]}'
+
+
+def resume_hint(r):
+    rt = r['runtime']
+    if rt == 'vscode':
+        return f'code {shlex.quote(r["cwd"])}  → Claude panel → "{r["name"]}"'
+    if rt == 'claude-code':
+        return f'Claude app → Code → "{r["name"]}"'
+    if rt.startswith('codex-app'):
+        return f'Codex app → "{r["name"]}"  or  {resume_cmd(r)}'
+    return resume_cmd(r)
+
+
+def print_block(r, reply_lines):
+    head = f'[{r["status"]} {ago(r["since"] if r["status"] == "waiting" else r["last_active"])}]'
+    print(f'{paint(head, r["status"])} {r["name"]}  ({r["runtime"]}, {short_cwd(r["cwd"])})  id {r["id"][:8]}')
+    if r['detail']:
+        print(f'  needs you: {one_line(r["detail"])}')
+    lines = r['reply'].splitlines() or ['(no reply text)']
+    for line in lines[:reply_lines] if reply_lines else lines:
+        print(f'  │ {line}')
+    if reply_lines and len(lines) > reply_lines:
+        print(f'  │ … {len(lines) - reply_lines} more lines: aitop show {r["id"][:8]}')
+    print(f'  resume: {resume_hint(r)}\n')
+
+
+# ---------------------------------------------------------------- seen state
+
+def load_seen():
+    if not os.path.exists(SEEN_PATH):
+        return {}
+    with open(SEEN_PATH) as f:
+        return json.load(f)
+
+
+def save_seen(seen):
+    os.makedirs(os.path.dirname(SEEN_PATH), exist_ok=True)
+    tmp = SEEN_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(seen, f, indent=1)
+    os.replace(tmp, SEEN_PATH)
+
+
+def ack_rows(rows):
+    seen = load_seen()
+    for r in rows:
+        seen[r['key']] = r['last_active']
+    save_seen(seen)
+
+
+class NotFound(Exception):
+    pass
+
+
+def resolve(prefix):
+    rows = collect(None, include_all=True, id_prefix=prefix)
+    if not rows:
+        raise NotFound(f'no session id starts with {prefix!r}')
+    if len(rows) > 1:
+        ids = ', '.join(f'{r["id"]} ({r["name"]})' for r in rows)
+        raise NotFound(f'{prefix!r} is ambiguous: {ids}')
+    return rows[0]
+
+
+def split_catchup(rows, since_ms):
+    """Sessions blocked on a decision, and your-turn sessions with a reply you have not acked."""
+    seen = load_seen()
+    cutoff = now_ms() - since_ms
+    waiting = sorted((r for r in rows if r['status'] == 'waiting'), key=lambda r: r['since'])
+    fresh = [r for r in rows if r['status'] == 'your-turn' and r['reply'] and r['last_active'] >= cutoff
+             and r['last_active'] > max(seen.get(r['key'], 0), r['focused'])]
+    return waiting, fresh
+
+
+def week_start_ms():
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((today - timedelta(days=today.weekday())).timestamp() * 1000)
+
+
+def week_rows():
+    """(Monday 00:00, sessions created since then, older sessions active again since then)."""
+    start = week_start_ms()
+    rows = collect(now_ms() - start, include_all=True)
+    return start, [r for r in rows if r['created'] >= start], [r for r in rows if r['created'] < start]
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(args):
+    since = args.since if args.since is not None or args.all else parse_since('7d')
+    rows = collect(since, include_all=args.all)
+    if args.runtime:
+        rows = [r for r in rows if r['runtime'].startswith(args.runtime)]
+    render_table(rows)
+
+
+def cmd_catchup(args):
+    waiting, fresh = split_catchup(collect(args.since), args.since)
+    for r in waiting + fresh:
+        print_block(r, 12)
+    if not waiting and not fresh:
+        print('nothing is waiting on you')
+        return
+    print(f'{len(waiting)} waiting on a decision · {len(fresh)} new replies · '
+          f'aitop show <id> for the full reply · aitop ack --all to clear')
+
+
+def cmd_show(args):
+    r = resolve(args.id)
+    if r['last_prompt']:
+        print('you asked:')
+        for line in r['last_prompt'].splitlines():
+            print(f'  > {line}')
+        print()
+    print_block(r, 0)
+    ack_rows([r])
+
+
+def cmd_ack(args):
+    if args.all == bool(args.ids):
+        sys.exit('aitop ack: give either session id prefixes or --all')
+    rows = collect(args.since) if args.all else [resolve(p) for p in args.ids]
+    ack_rows(rows)
+    print(f'acked {len(rows)} session(s)')
+
+
+def cmd_week(args):
+    start, new, resumed = week_rows()
+    print(f'== New this week (since {datetime.fromtimestamp(start / 1000):%a %m-%d}): {len(new)}\n')
+    render_table(new)
+    print(f'\n== Created earlier, active again this week: {len(resumed)}\n')
+    render_table(resumed)
+
+
+# ---------------------------------------------------------------- jump to a session
+
+GHOSTTY_APP = '/Applications/Ghostty.app'
+
+
+def applescript_str(s):
+    return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def terminal_steps(r):
+    """Open a new terminal window that resumes the session, keeping a shell when the agent exits."""
+    cmd = resume_cmd(r)
+    if sys.platform != 'darwin':
+        raise RuntimeError(f'Opening a terminal is only automated on macOS. Run it yourself:\n{cmd}')
+    if os.path.isdir(GHOSTTY_APP):
+        return 'Ghostty', [['osascript', '-e', '\n'.join([
+            'tell application "Ghostty"', 'activate', 'set cfg to new surface configuration',
+            f'set initial working directory of cfg to {applescript_str(r["cwd"])}',
+            f'set initial input of cfg to {applescript_str(cmd)} & linefeed',
+            'new window with configuration cfg', 'end tell'])]]
+    return 'Terminal', [['osascript', '-e', f'tell application "Terminal"\nactivate\ndo script {applescript_str(cmd)}\nend tell']]
+
+
+def host_app(pid):
+    """The .app bundle whose process tree contains pid, e.g. the terminal a CLI session runs in."""
+    while pid > 1:
+        out = subprocess.run(['ps', '-o', 'ppid=,comm=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        if not out:
+            return None
+        ppid, comm = out.split(None, 1)
+        if '.app/' in comm:
+            return comm[:comm.index('.app/') + len('.app')]
+        pid = int(ppid)
+    return None
+
+
+def open_steps(r, target):
+    """(app label, commands) that bring a session to the front; None in the list means pause."""
+    if target == 'terminal':
+        return terminal_steps(r)
+    rt = r['runtime'].split('/')[0]
+    if rt == 'vscode':
+        # The extension opens the session in the focused window, so focus the session's folder first.
+        focus = ['open', '-a', 'Visual Studio Code', r['cwd']] if sys.platform == 'darwin' else ['code', r['cwd']]
+        return 'VSCode', [focus, None, [OPENER, f'vscode://anthropic.claude-code/open?session={r["id"]}']]
+    if rt == 'claude-code' and r['desktop_id']:
+        return 'Claude', [[OPENER, f'claude://code/continue?session={r["desktop_id"]}']]
+    if rt == 'claude-cli' and r['pid'] and sys.platform == 'darwin':
+        app = host_app(r['pid'])
+        if app:
+            return os.path.basename(app)[:-len('.app')], [['open', '-a', app]]
+    if rt in ('codex-app', 'codex-chrome', 'codex'):
+        return 'Codex', [[OPENER, f'codex://threads/{r["id"]}']]
+    return terminal_steps(r)
+
+
+def run_steps(steps):
+    for step in steps:
+        if step is None:
+            time.sleep(1.2)  # let the window take focus before the next command targets it
+            continue
+        p = subprocess.run(step, capture_output=True, text=True, timeout=15)
+        if p.returncode:
+            raise RuntimeError(f'{step[0]} exited {p.returncode}: {p.stderr.strip()}')
+
+
+# ---------------------------------------------------------------- usage index (insights)
+
+USAGE_CACHE = os.path.join(CACHE_DIR, 'usage-v2.json')
+INDEX_LOCK = threading.Lock()
+EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
+# Patch headers inside apply_patch input; the path stops at a newline, an escaped newline or a quote.
+PATCH_FILE = re.compile(r'\*\*\* (?:Add|Update|Delete) File: ([^\n\\"]+)')
+RANGES = {'7d': 7, '30d': 30, '90d': 90, 'all': None}
+RUNTIME_ORDER = ['vscode', 'claude-code', 'codex-app', 'claude-cli', 'codex-cli', 'codex-chrome', 'codex',
+                 'claude-archive', 'other']
+
+
+def day_of(ts):
+    return time.strftime('%Y-%m-%d', time.localtime(ts))
+
+
+def usage_paths():
+    claude = (glob.glob(os.path.join(CLAUDE_DIR, 'projects', '*', '*.jsonl'))
+              + glob.glob(os.path.join(CLAUDE_DIR, 'projects', '*', '*', 'subagents', '*.jsonl')))
+    codex = (glob.glob(os.path.join(CODEX_DIR, 'sessions', '*', '*', '*', '*.jsonl'))
+             + glob.glob(os.path.join(CODEX_DIR, 'archived_sessions', '*.jsonl')))
+    return [('claude', p) for p in claude] + [('codex', p) for p in codex]
+
+
+def new_entry(kind, path, head):
+    e = {'kind': kind, 'head': head, 'offset': 0, 'first': None, 'cwd': '', 'runtime': None,
+         'prompts': [], 'tools': {}, 'edits': {}}
+    if kind == 'claude':
+        sub = os.path.basename(os.path.dirname(path)) == 'subagents'
+        sid = os.path.basename(os.path.dirname(os.path.dirname(path))) if sub else os.path.basename(path)[:-6]
+        e.update(session=sid, is_session=not sub, msgs={}, prs=[])
+    else:
+        e.update(session=None, is_session=False, model='', prev=[0, 0], tok={})  # filled from session_meta
+    return e
+
+
+def index_claude_line(e, line):
+    if e['runtime'] is None and b'"entrypoint"' in line:
+        rec = json.loads(line)
+        e['runtime'] = CLAUDE_RUNTIME.get(rec['entrypoint'], 'other')
+        e['cwd'] = rec.get('cwd') or ''
+    if b'"type":"assistant"' in line:
+        rec = json.loads(line)
+        if rec.get('type') != 'assistant':
+            return
+        ts = iso_ms(rec['timestamp']) // 1000
+        e['first'] = e['first'] or ts
+        msg = rec['message']
+        usage = msg.get('usage')
+        # Claude Code writes one record per content block, each repeating the message's usage.
+        if usage and msg.get('id') and msg['id'] not in e['msgs'] and msg.get('model') != '<synthetic>':
+            e['msgs'][msg['id']] = [ts, msg.get('model') or '?',
+                                    usage.get('input_tokens', 0) + usage.get('cache_creation_input_tokens', 0),
+                                    usage.get('cache_read_input_tokens', 0), usage.get('output_tokens', 0)]
+        for block in msg.get('content') or []:
+            if block.get('type') == 'tool_use':
+                day = day_of(ts)
+                e['tools'][day] = e['tools'].get(day, 0) + 1
+                path = (block.get('input') or {}).get('file_path')
+                if block['name'] in EDIT_TOOLS and path:
+                    e['edits'].setdefault(path, ts)
+    elif b'"type":"user"' in line and b'"tool_use_id"' not in line:
+        rec = json.loads(line)
+        if rec.get('type') == 'user' and claude_prompt(rec):
+            ts = iso_ms(rec['timestamp']) // 1000
+            e['first'] = e['first'] or ts
+            e['prompts'].append(ts)
+    elif b'"type":"pr-link"' in line:
+        rec = json.loads(line)
+        if rec.get('type') == 'pr-link':
+            e['prs'].append([iso_ms(rec['timestamp']) // 1000, rec['prUrl'], rec.get('prRepository', ''),
+                             rec.get('prNumber')])
+
+
+def index_codex_line(e, line):
+    if b'"session_meta"' in line:
+        rec = json.loads(line)
+        if rec.get('type') == 'session_meta' and e['session'] is None:
+            p = rec['payload']
+            source = p.get('source')
+            e['session'] = p['id']
+            e['is_session'] = isinstance(source, str) and p.get('thread_source') != 'guardian_review'
+            e['runtime'] = codex_runtime(source if isinstance(source, str) else '', p.get('originator') or '',
+                                         p.get('model_provider') or '')
+            e['cwd'] = p.get('cwd') or ''
+            e['first'] = iso_ms(p['timestamp']) // 1000
+        return
+    if b'"turn_context"' in line:
+        rec = json.loads(line)
+        if rec.get('type') == 'turn_context':
+            e['model'] = rec['payload'].get('model') or e['model']
+        return
+    if b'"token_count"' in line:
+        rec = json.loads(line)
+        info = (rec.get('payload') or {}).get('info')
+        if rec.get('type') != 'event_msg' or not info or not info.get('total_token_usage'):
+            return
+        t = info['total_token_usage']
+        cur = [t.get('input_tokens', 0), t.get('output_tokens', 0)]
+        if cur == e['prev']:
+            return  # re-emitted without a new request
+        e['prev'] = cur
+        # Sum per-request usage: the cumulative counter can restart mid-thread, so deltas of it overcount.
+        last = info.get('last_token_usage') or {}
+        cached = last.get('cached_input_tokens', 0)
+        key = f'{day_of(iso_ms(rec["timestamp"]) // 1000)}|{e["model"] or "?"}'
+        acc = e['tok'].setdefault(key, [0, 0, 0])
+        acc[0] += last.get('input_tokens', 0) - cached  # Codex input includes cached tokens
+        acc[1] += cached
+        acc[2] += last.get('output_tokens', 0)
+        return
+    if b'"task_started"' in line:
+        rec = json.loads(line)
+        if rec.get('type') == 'event_msg' and rec['payload'].get('type') == 'task_started':
+            e['prompts'].append(iso_ms(rec['timestamp']) // 1000)
+        return
+    if b'"type":"function_call"' in line or b'"type":"custom_tool_call"' in line:
+        rec = json.loads(line)
+        p = rec.get('payload') or {}
+        if rec.get('type') == 'response_item' and p.get('type') in ('function_call', 'custom_tool_call'):
+            ts = iso_ms(rec['timestamp']) // 1000
+            e['tools'][day_of(ts)] = e['tools'].get(day_of(ts), 0) + 1
+            for path in PATCH_FILE.findall(p.get('input') or p.get('arguments') or ''):
+                e['edits'].setdefault(path.strip(), ts)
+
+
+def load_usage():
+    """Index every transcript and rollout, reading only bytes appended since the last run.
+
+    Entries for files that have since been deleted stay in the cache, so cleanup does not erase history.
+    """
+    cache = {'files': {}}
+    if os.path.exists(USAGE_CACHE):
+        with open(USAGE_CACHE) as f:
+            cache = json.load(f)
+    files = cache['files']
+    changed = False
+    for kind, path in usage_paths():
+        try:
+            size = os.path.getsize(path)
+            e = files.get(path)
+            if e and e['offset'] == size:
+                continue
+            with open(path, 'rb') as f:
+                head = f.read(64).hex()
+                if not e or e['head'] != head or size < e['offset']:
+                    e = files[path] = new_entry(kind, path, head)
+                f.seek(e['offset'])
+                for line in f:
+                    if not line.endswith(b'\n'):
+                        break  # the agent is still writing this record
+                    e['offset'] += len(line)
+                    (index_claude_line if kind == 'claude' else index_codex_line)(e, line)
+        except FileNotFoundError:
+            continue  # deleted between glob and read
+        changed = True
+    if changed:
+        os.makedirs(os.path.dirname(USAGE_CACHE), exist_ok=True)
+        tmp = USAGE_CACHE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cache, f, separators=(',', ':'))
+        os.replace(tmp, USAGE_CACHE)
+    return files
+
+
+def claude_archive_days():
+    """Per-day session counts from Claude Code's own stats cache, which predates the kept transcripts."""
+    path = os.path.join(CLAUDE_DIR, 'stats-cache.json')
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return {a['date']: a['sessionCount'] for a in json.load(f).get('dailyActivity', [])}
+
+
+def stats(range_key):
+    if range_key not in RANGES:
+        raise argparse.ArgumentTypeError(f'range must be one of {", ".join(RANGES)}; got {range_key!r}')
+    with INDEX_LOCK:
+        files = load_usage()
+    today = datetime.now().date()
+    as_date = lambda ts: datetime.fromtimestamp(ts).date()
+
+    # Codex can hold the same thread twice (live and archived copies); keep the fuller one.
+    codex = {}
+    for e in files.values():
+        if e['kind'] == 'codex' and e['session'] and (e['session'] not in codex or e['offset'] > codex[e['session']]['offset']):
+            codex[e['session']] = e
+    entries = [e for e in files.values() if e['kind'] == 'claude'] + list(codex.values())
+    parent = {e['session']: e for e in entries if e['kind'] == 'claude' and e['is_session']}
+    claude_first = min((as_date(e['first']) for e in parent.values() if e['first']), default=today)
+    archive = {datetime.strptime(d, '%Y-%m-%d').date(): n for d, n in claude_archive_days().items()
+               if datetime.strptime(d, '%Y-%m-%d').date() < claude_first}
+
+    days = RANGES[range_key]
+    if days:
+        start = today - timedelta(days=days - 1)
+        prev_start = start - timedelta(days=days)
+    else:
+        firsts = [as_date(e['first']) for e in entries if e['first']] + list(archive)
+        start, prev_start = min(firsts, default=today), None
+    weekly = (today - start).days >= 92
+    bucket_of = (lambda d: d - timedelta(days=d.weekday())) if weekly else (lambda d: d)
+    buckets, d = [], bucket_of(start)
+    while d <= today:
+        buckets.append(d)
+        d += timedelta(days=7 if weekly else 1)
+    index = {b: i for i, b in enumerate(buckets)}
+
+    def period(d):
+        if start <= d <= today:
+            return 0
+        if prev_start and prev_start <= d < start:
+            return 1
+        return None
+
+    kpi = {k: [0, 0] for k in ('sessions', 'prompts', 'tokens', 'fresh', 'tools', 'edits', 'prs')}
+    sessions, tokens = {}, {}
+    prompts = [0] * len(buckets)
+    heat = [[0] * 24 for _ in range(7)]
+    models, projects, prs = {}, {}, {}
+    edits = [set(), set()]  # files touched per period, across sessions
+
+    def project(e):
+        cwd = e['cwd'] or parent.get(e['session'], {}).get('cwd', '')
+        return projects.setdefault(cwd or '(unknown)', {'name': os.path.basename(cwd) or '(unknown)', 'cwd': cwd,
+                                                        'sessions': 0, 'prompts': 0, 'tokens': 0, 'fresh': 0})
+
+    def add_tokens(e, rt, d, model, fresh_in, cached, out):
+        p = period(d)
+        if p is None:
+            return
+        kpi['tokens'][p] += fresh_in + cached + out
+        kpi['fresh'][p] += fresh_in + out
+        if p == 0:
+            series = tokens.setdefault(rt, [[0, 0, 0] for _ in buckets])[index[bucket_of(d)]]
+            series[0] += fresh_in
+            series[1] += cached
+            series[2] += out
+            m = models.setdefault(model, [0, 0, 0])
+            m[0] += fresh_in
+            m[1] += cached
+            m[2] += out
+            proj = project(e)
+            proj['tokens'] += fresh_in + cached + out
+            proj['fresh'] += fresh_in + out
+
+    seen_msgs = set()
+    for e in entries:
+        rt = (e['runtime'] or parent.get(e['session'], {}).get('runtime') or 'other').split('/')[0]
+        rt = rt if rt in RUNTIME_ORDER else 'other'
+        if e['is_session'] and e['first']:
+            d = as_date(e['first'])
+            p = period(d)
+            if p is not None:
+                kpi['sessions'][p] += 1
+            if p == 0:
+                sessions.setdefault(rt, [0] * len(buckets))[index[bucket_of(d)]] += 1
+                project(e)['sessions'] += 1
+        if e['is_session']:
+            for ts in e['prompts']:
+                d = as_date(ts)
+                p = period(d)
+                if p is not None:
+                    kpi['prompts'][p] += 1
+                if p == 0:
+                    prompts[index[bucket_of(d)]] += 1
+                    lt = time.localtime(ts)
+                    heat[lt.tm_wday][lt.tm_hour] += 1
+                    project(e)['prompts'] += 1
+        for day, n in e['tools'].items():
+            p = period(datetime.strptime(day, '%Y-%m-%d').date())
+            if p is not None:
+                kpi['tools'][p] += n
+        for path, ts in e['edits'].items():
+            p = period(as_date(ts))
+            if p is not None:
+                edits[p].add(path)
+        for ts, url, repo, number in e.get('prs', []):
+            if url not in prs or ts < prs[url][0]:
+                prs[url] = [ts, url, repo, number]
+        if e['kind'] == 'claude':
+            for mid, (ts, model, fresh_in, cached, out) in e['msgs'].items():
+                if mid not in seen_msgs:
+                    seen_msgs.add(mid)  # forked and resumed transcripts copy earlier messages
+                    add_tokens(e, rt, as_date(ts), model, fresh_in, cached, out)
+        else:
+            for key, (fresh_in, cached, out) in e['tok'].items():
+                day, model = key.split('|', 1)
+                add_tokens(e, rt, datetime.strptime(day, '%Y-%m-%d').date(), model, fresh_in, cached, out)
+
+    for d, n in archive.items():
+        p = period(d)
+        if p is not None:
+            kpi['sessions'][p] += n
+        if p == 0:
+            sessions.setdefault('claude-archive', [0] * len(buckets))[index[bucket_of(d)]] += n
+    kpi['edits'] = [len(edits[0]), len(edits[1])]
+    pr_list = sorted((v for v in prs.values() if period(as_date(v[0])) is not None), reverse=True)
+    for ts, *_ in pr_list:
+        kpi['prs'][period(as_date(ts))] += 1
+
+    present = [rt for rt in RUNTIME_ORDER if rt in sessions or rt in tokens]
+    return {
+        'range': range_key, 'bucket': 'week' if weekly else 'day', 'has_prev': prev_start is not None,
+        'buckets': [b.isoformat() for b in buckets], 'runtimes': present,
+        'sessions': sessions, 'tokens': tokens, 'prompts': prompts, 'kpi': kpi, 'heat': heat,
+        'models': sorted(([m, *v] for m, v in models.items()), key=lambda m: -(m[1] + m[3]))[:8],
+        'projects': sorted((p for p in projects.values() if p['tokens'] or p['sessions']),
+                           key=lambda p: -p['fresh'])[:8],
+        'prs': [{'ts': ts, 'url': url, 'repo': repo, 'number': number}
+                for ts, url, repo, number in pr_list if period(as_date(ts)) == 0][:12],
+        'archive_until': claude_first.isoformat() if archive else None,
+        'indexed': {'files': len(files), 'bytes': sum(e['offset'] for e in files.values())},
+    }
+
+
+# ---------------------------------------------------------------- briefings
+
+DEFAULT_CONFIG = {
+    'brief': {
+        'language': 'English',
+        'categories': ['Feature development', 'Reliability', 'Efficiency', 'Security', 'Research', 'Other'],
+        # Headless and toolless, and not saved as a session of its own.
+        'command': ['claude', '-p', '--no-session-persistence', '--tools', '', '--strict-mcp-config'],
+        'timeout': 900,
+        'digest_chars': 160000,
+    },
+}
+BRIEF_KINDS = ('daily', 'weekly', 'monthly')
+BRIEF_DIR = os.path.join(CACHE_DIR, 'briefs')
+BRIEF_JOBS = {}
+BRIEF_LOCK = threading.Lock()
+BRIEF_SCHEMA = json.dumps({
+    'headline': 'One sentence on the main work of the period',
+    'categories': [{'name': '<one of the categories>', 'projects': [{'name': '<project>', 'tasks': [{
+        'title': '<task>', 'progress': 'done', 'summary': '<what was done>', 'outputs': ['<link or deliverable>'],
+        'todos': ['<open follow-up>'], 'sessions': ['1a2b3c4d']}]}]}],
+    'next_steps': ['<most important open follow-ups across all work>'],
+    'skipped': ['<8-char ids of personal sessions left out>'],
+}, indent=1)
+BRIEF_PROMPT = """You are writing a {kind} work briefing for one person, covering {label} ({start} to {last}).
+Below is a digest of every AI agent session that person worked in during the period: what they asked and what the agent reported back.
+
+Write every text field in {language}.
+
+Group the work this way:
+- category: exactly one of: {categories}.
+- project: the real project, system or initiative the work served. Infer it from what the turns are about. The working directory is only a hint, since one directory often holds many unrelated projects.
+- task: one concrete piece of work. Merge sessions and turns that worked on the same task into one task.
+
+For each task give:
+- progress: one of "done", "in progress", "blocked", "not started".
+- summary: one or two sentences on what was done, keeping specific numbers, names and ids from the digest.
+- outputs: concrete results such as links, tickets, merge requests, documents, files or decisions. Copy URLs exactly.
+- todos: follow-ups the digest shows are still open.
+- sessions: the 8-character ids of the sessions that contributed.
+
+Leave out sessions that are clearly personal and unrelated to work, and list their ids in "skipped".
+Use only facts present in the digest. Never invent progress, links or todos. Use an empty list when a field has nothing.
+
+Reply with JSON only, with no prose and no code fence, in this shape:
+{schema}
+
+Digest:
+
+{digest}
+"""
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            for section, values in json.load(f).items():
+                cfg.setdefault(section, {}).update(values)
+    return cfg
+
+
+def parse_day(value):
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected a date like 2026-10-30; got {value!r}')
+
+
+def brief_period(kind, day):
+    """(first day, day after the last, label) of the period that contains day."""
+    if kind not in BRIEF_KINDS:
+        raise argparse.ArgumentTypeError(f'kind must be one of {", ".join(BRIEF_KINDS)}; got {kind!r}')
+    if kind == 'daily':
+        return day, day + timedelta(days=1), day.strftime('%A, %b %-d, %Y')
+    if kind == 'weekly':
+        start = day - timedelta(days=day.weekday())
+        return start, start + timedelta(days=7), f'Week of {start:%b %-d, %Y}'
+    start = day.replace(day=1)
+    return start, (start + timedelta(days=32)).replace(day=1), start.strftime('%B %Y')
+
+
+def local_ts(d):
+    return time.mktime(d.timetuple())
+
+
+def clip(text, n):
+    text = re.sub(r'\n{3,}', '\n\n', text.strip())
+    return text if len(text) <= n else text[:n].rstrip() + ' …'
+
+
+def claude_turns(path, t0, t1):
+    """[ts, prompt, final reply] for each human prompt sent in [t0, t1)."""
+    turns = []
+    with open(path, 'rb') as f:
+        for line in f:
+            if not line.endswith(b'\n'):
+                break  # the agent is still writing this record
+            if b'"type":"user"' in line and b'"tool_use_id"' not in line:
+                rec = json.loads(line)
+                prompt = claude_prompt(rec) if rec.get('type') == 'user' else ''
+                if prompt:
+                    turns.append([iso_ms(rec['timestamp']) // 1000, prompt, ''])
+            elif turns and b'"type":"assistant"' in line:
+                rec = json.loads(line)
+                if rec.get('type') == 'assistant' and not rec.get('isSidechain'):
+                    text = claude_text(rec['message'].get('content') or []).strip()
+                    if text:
+                        turns[-1][2] = text
+    return [t for t in turns if t0 <= t[0] < t1]
+
+
+def codex_turns(path, t0, t1):
+    turns = []
+    with open(path, 'rb') as f:
+        for line in f:
+            if not line.endswith(b'\n'):
+                break
+            if b'"role":"user"' in line:
+                rec = json.loads(line)
+                p = rec.get('payload') or {}
+                if rec.get('type') == 'response_item' and p.get('type') == 'message' and p.get('role') == 'user':
+                    text = '\n'.join(c.get('text', '') for c in p.get('content') or [] if 'text' in c).strip()
+                    # Codex injects context (environment, instructions) as user messages wrapped in tags.
+                    if text and not text.startswith('<') and not text.startswith('# AGENTS.md'):
+                        turns.append([iso_ms(rec['timestamp']) // 1000, codex_request(text), ''])
+            elif turns and b'"task_complete"' in line:
+                rec = json.loads(line)
+                p = rec.get('payload') or {}
+                if rec.get('type') == 'event_msg' and p.get('type') == 'task_complete' and p.get('last_agent_message'):
+                    turns[-1][2] = p['last_agent_message']
+    return [t for t in turns if t0 <= t[0] < t1]
+
+
+def active_entries(t0, t1):
+    """{session id: (path, index entry)} for sessions with a prompt in [t0, t1) whose file still exists."""
+    with INDEX_LOCK:
+        files = load_usage()
+    picked = {}
+    for path, e in files.items():
+        if not (e['is_session'] and e['session'] and any(t0 <= ts < t1 for ts in e['prompts'])):
+            continue
+        if os.path.exists(path) and (e['session'] not in picked or e['offset'] > picked[e['session']][1]['offset']):
+            picked[e['session']] = (path, e)
+    return picked
+
+
+def brief_sessions(start, end):
+    t0, t1 = local_ts(start), local_ts(end)
+    rows = {r['id']: r for r in collect(None, include_all=True)}
+    sessions = []
+    for sid, (path, e) in active_entries(t0, t1).items():
+        turns = (claude_turns if e['kind'] == 'claude' else codex_turns)(path, t0, t1)
+        if not turns:
+            continue
+        r = rows.get(sid, {})
+        sessions.append({
+            'id': sid, 'name': r.get('name') or sid[:8], 'runtime': r.get('runtime') or e['runtime'] or e['kind'],
+            'status': r.get('status', 'closed'), 'cwd': e['cwd'] or r.get('cwd', ''), 'opened_with': r.get('brief', ''),
+            'turns': turns, 'edits': sorted(p for p, ts in e['edits'].items() if t0 <= ts < t1),
+            'prs': sorted({url for ts, url, *_ in e.get('prs', []) if t0 <= ts < t1}),
+        })
+    return sorted(sessions, key=lambda s: s['turns'][0][0])
+
+
+def brief_digest(sessions, budget):
+    per_session = max(1500, budget // max(1, len(sessions)))
+    parts = []
+    for s in sessions:
+        head = [f'### Session {s["id"][:8]}: {s["name"]}',
+                f'Runtime: {s["runtime"]}. Working directory: {s["cwd"] or "unknown"}. Status now: {s["status"]}.']
+        if s['opened_with']:
+            head.append(f'Session opened with: {clip(s["opened_with"], 300)}')
+        if s['prs']:
+            head.append('PRs/MRs linked: ' + ', '.join(s['prs']))
+        if s['edits']:
+            head.append(f'Files edited ({len(s["edits"])}): ' + ', '.join(os.path.basename(p) for p in s['edits'][:12]))
+        turns = [f'- [{time.strftime("%m-%d %H:%M", time.localtime(ts))}] Asked: {clip(prompt, 500)}\n'
+                 f'  Result: {clip(reply, 900) if reply else "(no reply yet)"}' for ts, prompt, reply in s['turns']]
+        # Keep the first turn for context, then as many of the latest turns as the budget allows.
+        kept, latest, used = turns[:1], [], sum(map(len, head)) + len(turns[0])
+        for t in reversed(turns[1:]):
+            if used + len(t) > per_session:
+                break
+            latest.insert(0, t)
+            used += len(t)
+        omitted = len(turns) - 1 - len(latest)
+        parts.append('\n'.join(head + kept + ([f'- ({omitted} turns in between left out)'] if omitted else []) + latest))
+    return '\n\n'.join(parts)
+
+
+def run_brief_llm(prompt, cfg):
+    workdir = os.path.join(CACHE_DIR, 'brief-runs')  # a fixed folder keeps runs out of real project folders
+    os.makedirs(workdir, exist_ok=True)
+    p = subprocess.run(cfg['command'], input=prompt, capture_output=True, text=True, timeout=cfg['timeout'], cwd=workdir)
+    if p.returncode:
+        raise RuntimeError(f'{cfg["command"][0]} exited {p.returncode}: {p.stderr.strip()[-2000:]}')
+    start = p.stdout.find('{')  # the CLI may print notices or a code fence around the JSON
+    if start < 0:
+        raise ValueError(f'The LLM reply contained no JSON object:\n{p.stdout.strip()[:2000]}')
+    try:
+        return json.JSONDecoder().raw_decode(p.stdout, start)[0]
+    except json.JSONDecodeError as e:
+        raise ValueError(f'The LLM reply was not valid JSON ({e}):\n{p.stdout[start:start + 2000]}') from e
+
+
+def merge_groups(report):
+    """Fold categories and projects the model repeated under the same name into one."""
+    cats = {}
+    for cat in report.get('categories', []):
+        cats.setdefault(cat['name'].strip().lower(), {'name': cat['name'], 'projects': []})['projects'] += cat.get('projects', [])
+    for cat in cats.values():
+        projects = {}
+        for proj in cat['projects']:
+            projects.setdefault(proj['name'].strip().lower(), {'name': proj['name'], 'tasks': []})['tasks'] += proj.get('tasks', [])
+        cat['projects'] = list(projects.values())
+    report['categories'] = list(cats.values())
+    return report
+
+
+def brief_path(kind, start):
+    return os.path.join(BRIEF_DIR, f'{kind}-{start.isoformat()}.json')
+
+
+def generate_brief(kind, day):
+    cfg = load_config()['brief']
+    start, end, label = brief_period(kind, day)
+    sessions = brief_sessions(start, end)
+    if not sessions:
+        raise NotFound(f'No session had a prompt in {label}.')
+    digest = brief_digest(sessions, cfg['digest_chars'])
+    prompt = BRIEF_PROMPT.format(kind=kind, label=label, start=start, last=end - timedelta(days=1),
+                                 language=cfg['language'], categories=', '.join(cfg['categories']),
+                                 schema=BRIEF_SCHEMA, digest=digest)
+    report = merge_groups(run_brief_llm(prompt, cfg))
+    brief = {
+        'kind': kind, 'start': start.isoformat(), 'end': end.isoformat(), 'label': label,
+        'generated_at': int(time.time()), 'command': cfg['command'][0], 'digest_chars': len(digest),
+        'sessions': {s['id'][:8]: {'id': s['id'], 'name': s['name'], 'runtime': s['runtime']} for s in sessions},
+        'stats': {'sessions': len(sessions), 'prompts': sum(len(s['turns']) for s in sessions),
+                  'edits': len({p for s in sessions for p in s['edits']}), 'prs': len({u for s in sessions for u in s['prs']})},
+        'report': report,
+    }
+    os.makedirs(BRIEF_DIR, exist_ok=True)
+    tmp = brief_path(kind, start) + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(brief, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, brief_path(kind, start))
+    return brief
+
+
+def brief_markdown(brief):
+    r, s = brief['report'], brief['stats']
+    lines = [f'# {brief["label"]}', '', r.get('headline', ''), '',
+             f'{s["sessions"]} sessions, {s["prompts"]} prompts, {s["edits"]} files edited, {s["prs"]} PRs/MRs linked.']
+    for cat in r.get('categories', []):
+        lines += ['', f'## {cat["name"]}']
+        for proj in cat.get('projects', []):
+            lines += ['', f'### {proj["name"]}']
+            for t in proj.get('tasks', []):
+                lines.append(f'- **{t["title"]}** ({t.get("progress", "")}): {t.get("summary", "")}')
+                if t.get('outputs'):
+                    lines.append('  - Outputs: ' + '; '.join(t['outputs']))
+                if t.get('todos'):
+                    lines.append('  - Todo: ' + '; '.join(t['todos']))
+    if r.get('next_steps'):
+        lines += ['', '## Next steps', ''] + [f'- {x}' for x in r['next_steps']]
+    return '\n'.join(lines).strip() + '\n'
+
+
+def load_brief(kind, start):
+    path = brief_path(kind, start)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        brief = json.load(f)
+    merge_groups(brief['report'])
+    return brief
+
+
+def brief_state(kind, day):
+    start, end, label = brief_period(kind, day)
+    brief = load_brief(kind, start)
+    return {'kind': kind, 'start': start.isoformat(), 'end': end.isoformat(), 'label': label,
+            'today': date.today().isoformat(), 'active': len(active_entries(local_ts(start), local_ts(end))),
+            'brief': brief, 'markdown': brief_markdown(brief) if brief else None,
+            'job': BRIEF_JOBS.get(f'{kind}-{start}')}
+
+
+def start_brief_job(kind, day):
+    start, _, _ = brief_period(kind, day)
+    key = f'{kind}-{start}'
+    with BRIEF_LOCK:
+        if BRIEF_JOBS.get(key, {}).get('state') == 'running':
+            return BRIEF_JOBS[key]
+        job = BRIEF_JOBS[key] = {'state': 'running', 'started': int(time.time()), 'error': None}
+
+    def work():
+        try:
+            generate_brief(kind, day)
+            job['state'] = 'done'
+        except Exception as e:
+            traceback.print_exc()
+            job.update(state='failed', error=f'{type(e).__name__}: {e}')
+
+    threading.Thread(target=work, daemon=True).start()
+    return job
+
+
+def cmd_brief(args):
+    start, _, label = brief_period(args.kind, args.date)
+    brief = None if args.regenerate else load_brief(args.kind, start)
+    if brief is None:
+        print(f'Writing the {args.kind} briefing for {label} with {load_config()["brief"]["command"][0]}; '
+              'this can take a few minutes.', file=sys.stderr, flush=True)
+        brief = generate_brief(args.kind, args.date)
+    print(brief_markdown(brief), end='')
+
+
+# ---------------------------------------------------------------- portal
+
+def to_json(r, full=False):
+    out = {k: r[k] for k in ('id', 'status', 'detail', 'since', 'live', 'runtime', 'name', 'last_active', 'created',
+                             'cwd')}
+    out.update(brief=r['brief'][:400], step=r['step'][:300], where=short_cwd(r['cwd']))
+    if full:
+        out.update(reply=r['reply'], last_prompt=r['last_prompt'], resume=resume_hint(r), resume_cmd=resume_cmd(r))
+    return out
+
+
+def api_get(path, q):
+    if path == '/api/catchup':
+        since = parse_since(q.get('since', '7d'))
+        rows = collect(since)
+        waiting, fresh = split_catchup(rows, since)
+        runtimes = {}
+        for r in rows:
+            runtimes.setdefault(r['runtime'].split('/')[0], {'waiting': 0, 'running': 0, 'your-turn': 0})[r['status']] += 1
+        return {'counts': {s: sum(r['status'] == s for r in rows) for s in STATUS_ORDER},
+                'runtimes': runtimes, 'terminal': 'Ghostty' if os.path.isdir(GHOSTTY_APP) else 'Terminal',
+                'waiting': [to_json(r, full=True) for r in waiting],
+                'fresh': [to_json(r, full=True) for r in fresh]}
+    if path == '/api/stats':
+        return stats(q.get('range', '30d'))
+    if path == '/api/week':
+        start, new, resumed = week_rows()
+        return {'start': start, 'new': [to_json(r) for r in new], 'resumed': [to_json(r) for r in resumed]}
+    if path == '/api/list':
+        since = parse_since(q['since']) if q.get('since') else None
+        return {'rows': [to_json(r) for r in collect(since, include_all=q.get('all') == '1')]}
+    if path == '/api/session':
+        return to_json(resolve(q['id']), full=True)
+    if path == '/api/brief':
+        return brief_state(q.get('kind', 'weekly'), parse_day(q['date']) if q.get('date') else date.today())
+    raise NotFound(f'no route {path}')
+
+
+def api_post(path, body):
+    if path == '/api/open':
+        app, steps = open_steps(resolve(body['id']), body.get('target', 'app'))
+        run_steps(steps)
+        return {'app': app}
+    if path == '/api/brief':
+        return start_brief_job(body['kind'], parse_day(body['date']))
+    if path != '/api/ack':
+        raise NotFound(f'no route {path}')
+    rows = collect(parse_since('7d')) if body.get('all') else [resolve(i) for i in body['ids']]
+    ack_rows(rows)
+    return {'acked': len(rows)}
+
+
+class PortalHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # the page polls every 20s; access logs would bury the tracebacks printed below
+
+    def send(self, code, body, ctype='application/json; charset=utf-8'):
+        data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self.dispatch()
+
+    def do_POST(self):
+        self.dispatch()
+
+    def dispatch(self):
+        # Answer only requests addressed to this loopback port, so a DNS-rebinding page cannot read sessions.
+        if self.headers.get('Host') not in self.server.allowed_hosts:
+            return self.send(403, {'error': 'unexpected Host header'})
+        url = urlparse(self.path)
+        if self.command == 'GET' and url.path == '/':
+            return self.send(200, PORTAL_HTML.encode(), 'text/html; charset=utf-8')
+        try:
+            if self.command == 'GET':
+                body = api_get(url.path, {k: v[0] for k, v in parse_qs(url.query).items()})
+            elif self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
+                # A JSON body forces a CORS preflight on cross-site POSTs, and this server never approves one.
+                return self.send(415, {'error': 'expected application/json'})
+            else:
+                body = api_post(url.path, json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+        except NotFound as e:
+            return self.send(404, {'error': str(e)})
+        except argparse.ArgumentTypeError as e:
+            return self.send(400, {'error': str(e)})
+        except Exception:
+            traceback.print_exc()
+            return self.send(500, {'error': traceback.format_exc()})
+        self.send(200, body)
+
+
+def cmd_serve(args):
+    server = ThreadingHTTPServer(('127.0.0.1', args.port), PortalHandler)
+    server.allowed_hosts = {f'127.0.0.1:{args.port}', f'localhost:{args.port}'}
+    print(f'aitop portal: http://127.0.0.1:{args.port}/  (Ctrl-C to stop)', flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+PORTAL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitop</title>
+<style>
+:root {
+  color-scheme: light;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Segoe UI", system-ui, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --canvas: #f3f5f8; --surface: #ffffff; --raised: #f8f9fb; --sunken: #edf0f4;
+  --ink: #101828; --ink-2: #475467; --muted: #8a94a6; --line: #e4e8ee; --line-strong: #d3d9e1;
+  --grid: #edf0f4; --axis: #cdd4dd; --bar: #5b6b82; --heat: 16 24 40;
+  --pop: 0 16px 40px rgba(16, 24, 40, .16), 0 2px 6px rgba(16, 24, 40, .08);
+  /* Runtime identity: categorical slots in fixed order, validated for CVD separation (light surface #fff). */
+  --rt-vscode: #2a78d6; --rt-claude-code: #eb6834; --rt-codex-app: #1baf7a; --rt-claude-cli: #eda100;
+  --rt-codex-cli: #e87ba4; --rt-codex-chrome: #008300; --rt-codex: #6250d6; --rt-claude-archive: #a3acb9; --rt-other: #a3acb9;
+  /* Session state: status palette, always shown with an icon and a label. */
+  --st-waiting: #d03b3b; --st-running: #e09a00; --st-your-turn: #0ca30c; --st-closed: #8a94a6; --st-archived: #8a94a6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --canvas: #0e1218; --surface: #151a22; --raised: #1a2029; --sunken: #1e252f;
+    --ink: #e8ecf2; --ink-2: #a9b3c1; --muted: #6f7b8c; --line: #232a35; --line-strong: #303946;
+    --grid: #1f2630; --axis: #36404d; --bar: #8d9bb0; --heat: 222 228 238;
+    --pop: 0 16px 40px rgba(0, 0, 0, .5), 0 2px 6px rgba(0, 0, 0, .3);
+    --rt-vscode: #3987e5; --rt-claude-code: #d95926; --rt-codex-app: #199e70; --rt-claude-cli: #c98500;
+    --rt-codex-cli: #d55181; --rt-codex-chrome: #008300; --rt-codex: #9085e9; --rt-claude-archive: #5d6878; --rt-other: #5d6878;
+    --st-waiting: #e5534b; --st-running: #fab219; --st-your-turn: #2bb52b;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--canvas); color: var(--ink); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+button, input, select { font: inherit; color: inherit; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 6px; }
+.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.mono, code { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+.spacer { flex: 1; }
+
+/* shell */
+.app { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100vh; }
+.rail { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 24px; padding: 20px 12px 16px;
+  background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 0 10px; font-weight: 680; font-size: 16px; letter-spacing: -.02em; }
+.brand-mark { display: grid; grid-template-columns: repeat(2, 9px); gap: 2px; }
+.brand-mark i { width: 9px; height: 9px; border-radius: 2.5px; }
+.nav { display: flex; flex-direction: column; gap: 2px; }
+.nav button { display: flex; align-items: center; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; border-radius: 8px;
+  background: none; color: var(--ink-2); font-weight: 540; cursor: pointer; text-align: left; }
+.nav button:hover { background: var(--sunken); color: var(--ink); }
+.nav button.active { background: var(--sunken); color: var(--ink); box-shadow: inset 2px 0 0 var(--ink); }
+.nav .count { margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: var(--st-waiting);
+  color: #fff; font-size: 11.5px; font-weight: 650; line-height: 20px; text-align: center; }
+.nav .count:empty { display: none; }
+.rail-label { padding: 0 10px 6px; color: var(--muted); font-size: 12px; font-weight: 560; }
+.rt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.rt-item { display: flex; align-items: center; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; border-radius: 8px;
+  background: none; color: var(--ink-2); cursor: pointer; text-align: left; font-size: 13px; }
+.rt-item:hover, .rt-item.on { background: var(--sunken); color: var(--ink); }
+.rt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rt-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.rt-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--st-waiting); font-weight: 650; font-variant-numeric: tabular-nums; }
+.rt-wait::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.rail-foot { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px;
+  font-size: 12.5px; color: var(--ink-2); }
+.live { display: flex; align-items: center; gap: 8px; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.live.on .live-dot { background: var(--st-your-turn); box-shadow: 0 0 0 0 color-mix(in srgb, var(--st-your-turn) 50%, transparent);
+  animation: beacon 2.4s ease-out infinite; }
+@keyframes beacon { 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: pointer; }
+.switch input { appearance: none; width: 30px; height: 18px; border-radius: 9px; background: var(--line-strong); position: relative; cursor: pointer; margin: 0; transition: background .15s; }
+.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform .15s; }
+.switch input:checked { background: var(--ink); }
+.switch input:checked::after { transform: translateX(12px); background: var(--surface); }
+
+.main { min-width: 0; padding: 28px 36px 72px; }
+.page-head { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+.page-head h1 { margin: 0; font-size: 26px; font-weight: 680; letter-spacing: -.025em; line-height: 1.2; }
+.page-head p { margin: 6px 0 0; color: var(--ink-2); }
+.head-actions { margin-left: auto; display: flex; gap: 8px; }
+.view.busy { opacity: .55; transition: opacity .2s; }
+.banner { margin: 0 0 18px; padding: 12px 14px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--st-waiting) 35%, transparent);
+  background: color-mix(in srgb, var(--st-waiting) 8%, var(--surface)); color: var(--ink); white-space: pre-wrap; font: 12.5px/1.5 var(--mono); }
+
+/* controls */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 32px; padding: 0 12px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); font-weight: 560; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--raised); border-color: var(--axis); }
+.btn.primary { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+.btn.primary:hover { background: color-mix(in srgb, var(--ink) 86%, var(--surface)); }
+.btn.ghost { border-color: transparent; background: none; color: var(--ink-2); }
+.btn.ghost:hover { background: var(--sunken); color: var(--ink); }
+.btn.icon-only { width: 32px; padding: 0; }
+.seg { display: inline-flex; padding: 2px; gap: 2px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); }
+.seg button { height: 28px; padding: 0 12px; border: 0; border-radius: 7px; background: none; color: var(--ink-2); font-weight: 560; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.seg button:hover { color: var(--ink); }
+.seg button.on { background: var(--ink); color: var(--surface); }
+.filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.search { position: relative; flex: 1; min-width: 220px; max-width: 420px; }
+.search .i { position: absolute; left: 10px; top: 8px; color: var(--muted); }
+.search input { width: 100%; }
+.field { height: 32px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); }
+.search .field { padding-left: 32px; }
+.check { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-2); cursor: pointer; user-select: none; font-size: 13px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+
+/* runtime tiles and status pills */
+.tile { --c: var(--rt-other); display: inline-grid; place-items: center; flex: none; width: 30px; height: 30px; border-radius: 8px;
+  color: var(--c); background: color-mix(in srgb, var(--c) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 28%, transparent); }
+.tile .i { width: 17px; height: 17px; stroke-width: 1.7; }
+.tile.sm { width: 22px; height: 22px; border-radius: 6px; }
+.tile.sm .i { width: 13px; height: 13px; }
+.rt-vscode { --c: var(--rt-vscode); } .rt-claude-code { --c: var(--rt-claude-code); } .rt-codex-app { --c: var(--rt-codex-app); }
+.rt-claude-cli { --c: var(--rt-claude-cli); } .rt-codex-cli { --c: var(--rt-codex-cli); } .rt-codex-chrome { --c: var(--rt-codex-chrome); }
+.rt-codex { --c: var(--rt-codex); } .rt-claude-archive { --c: var(--rt-claude-archive); } .rt-other { --c: var(--rt-other); }
+.s-pill { --s: var(--st-closed); display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px 0 6px; border-radius: 6px;
+  background: color-mix(in srgb, var(--s) 12%, transparent); color: var(--ink); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.s-pill .i { width: 13px; height: 13px; color: var(--s); stroke-width: 2; }
+.s-waiting { --s: var(--st-waiting); } .s-running { --s: var(--st-running); } .s-your-turn { --s: var(--st-your-turn); }
+.s-closed { --s: var(--st-closed); } .s-archived { --s: var(--st-archived); }
+.s-running .i { animation: spin 1.1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.chip { border: 0; cursor: pointer; height: 26px; }
+.chip.off { opacity: .4; }
+@media (prefers-reduced-motion: reduce) { .s-running .i, .live.on .live-dot { animation: none; } }
+
+/* links that jump to the session */
+.title-link { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; padding: 0; border: 0; background: none;
+  color: var(--ink); font-weight: 620; cursor: pointer; text-align: left; }
+.title-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title-link .i { width: 13px; height: 13px; color: var(--muted); opacity: 0; transition: opacity .12s; }
+.title-link:hover span { text-decoration: underline; text-decoration-color: var(--axis); text-underline-offset: 3px; }
+.title-link:hover .i, .title-link:focus-visible .i { opacity: 1; }
+
+/* inbox */
+.sec-head { display: flex; align-items: baseline; gap: 10px; margin: 28px 0 12px; }
+.sec-head:first-child { margin-top: 0; }
+.sec-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.sec-head .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.sec-head .note { color: var(--muted); font-size: 13px; }
+.sec-head .btn { align-self: center; margin-left: auto; }
+.inbox { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.item { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; gap: 0 14px; padding: 18px 20px; border-top: 1px solid var(--line); }
+.item:first-child { border-top: 0; }
+.item-body { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.item-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.item-title .title-link { font-size: 15px; }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12.5px; }
+.callout { padding: 8px 12px; border-left: 2px solid var(--st-waiting); border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--st-waiting) 7%, transparent); font-size: 13.5px; overflow-wrap: anywhere; }
+.preview { margin-top: 2px; color: var(--ink-2); font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.item-actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.empty { padding: 28px 20px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--ink-2); text-align: center; }
+.empty strong { display: block; color: var(--ink); font-size: 15px; margin-bottom: 4px; }
+
+/* session table */
+.table { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.tr { display: grid; grid-template-columns: minmax(0, 2.5fr) 118px minmax(0, 1.8fr) minmax(0, 1fr) 56px; gap: 16px; align-items: center;
+  padding: 11px 16px; border-top: 1px solid var(--line); cursor: pointer; }
+.tr:first-child { border-top: 0; }
+.tr:hover { background: var(--raised); }
+.tr.head { cursor: default; background: var(--raised); color: var(--muted); font-size: 12px; font-weight: 600; padding-block: 9px; }
+.cell-session { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.cell-session > div { min-width: 0; }
+.sub { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-step { color: var(--ink-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-proj { min-width: 0; font-size: 13px; }
+.cell-proj > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-time { text-align: right; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.foot-note { margin-top: 10px; color: var(--muted); font-size: 12.5px; }
+
+/* insights */
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 16px; }
+.kpi { padding: 16px 18px 15px; border-left: 1px solid var(--line); min-width: 0; }
+.kpi:first-child { border-left: 0; }
+.kpi-label { color: var(--ink-2); font-size: 13px; }
+.kpi-value { margin-top: 4px; font-size: 28px; font-weight: 680; letter-spacing: -.02em; line-height: 1.15; }
+.kpi-delta { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; min-width: 0; }
+.panel-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.panel-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.panel-head p { margin: 0; color: var(--muted); font-size: 13px; }
+.panel-head .seg { margin-left: auto; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.grid-2 > .panel { margin-bottom: 16px; }
+.chart { display: block; width: 100%; overflow: visible; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; }
+.chart .baseline { stroke: var(--axis); stroke-width: 1; }
+.chart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart .hit { fill: transparent; }
+.chart .col { cursor: default; }
+.chart:hover .col:not(:hover) .seg { opacity: .5; }
+.chart .cell.zero { fill: var(--sunken); }
+.chart .cell:hover { stroke: var(--ink); stroke-width: 1.5; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; font-size: 12.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ramp { display: flex; align-items: center; gap: 6px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+.ramp i { width: 14px; height: 10px; border-radius: 3px; }
+.hbars { display: flex; flex-direction: column; gap: 10px; }
+.hb-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 2fr) 60px; gap: 12px; align-items: center; font-size: 13px; }
+.hb-label { min-width: 0; display: flex; flex-direction: column; }
+.hb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.hb-sub { color: var(--muted); font-size: 12px; }
+.hb-track { height: 10px; }
+.hb-bar { height: 10px; border-radius: 0 4px 4px 0; background: var(--bar); min-width: 2px; }
+.hb-val { text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.prs { display: flex; flex-direction: column; }
+.pr { display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: 12px; align-items: baseline; padding: 9px 0; border-top: 1px solid var(--line);
+  color: var(--ink); text-decoration: none; font-size: 13px; }
+.pr:first-child { border-top: 0; padding-top: 0; }
+.pr:hover .pr-repo { text-decoration: underline; text-underline-offset: 3px; }
+.pr-ref { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+.pr-repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-date { color: var(--muted); font-size: 12px; }
+details.panel summary { cursor: pointer; font-weight: 600; }
+.data { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.data th, .data td { padding: 6px 10px; border-top: 1px solid var(--line); text-align: right; }
+.data th:first-child, .data td:first-child { text-align: left; }
+.data th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.small { font-size: 12.5px; }
+
+/* briefings */
+.period { display: inline-flex; align-items: center; gap: 6px; }
+.period-label { min-width: 190px; text-align: center; font-weight: 620; }
+.btn[disabled] { opacity: .4; cursor: default; pointer-events: none; }
+.headline { margin: 4px 0 6px; max-width: 82ch; font-size: 18px; font-weight: 560; line-height: 1.55; letter-spacing: -.01em; }
+.bstats { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 16px 0 6px; }
+.bstats div { display: flex; align-items: baseline; gap: 6px; color: var(--ink-2); font-size: 13px; }
+.bstats b { color: var(--ink); font-size: 20px; font-weight: 680; letter-spacing: -.01em; }
+.brief-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.proj { padding: 16px 20px; border-top: 1px solid var(--line); }
+.proj:first-child { border-top: 0; }
+.proj h3 { margin: 0 0 10px; font-size: 14px; font-weight: 650; }
+.task { display: flex; flex-direction: column; gap: 7px; padding: 12px 0; border-top: 1px solid var(--grid); }
+.task:nth-child(2) { border-top: 0; padding-top: 0; }
+.task-head { display: flex; align-items: flex-start; gap: 10px; }
+.task-title { font-weight: 600; padding-top: 1px; }
+.task-sum { margin: 0; max-width: 92ch; color: var(--ink-2); overflow-wrap: anywhere; }
+.task-list { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; font-size: 13px; }
+.tl-label { padding-top: 1px; color: var(--muted); font-size: 12px; }
+.task-list ul { margin: 0; padding-left: 16px; }
+.task-list li { overflow-wrap: anywhere; }
+.task a, .next a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--axis); text-underline-offset: 3px; }
+.task-sessions { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-s { display: inline-flex; align-items: center; gap: 6px; max-width: 280px; height: 28px; padding: 0 9px 0 3px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--raised); color: var(--ink-2); font-size: 12px; cursor: pointer; }
+.chip-s span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-s:hover { border-color: var(--axis); color: var(--ink); }
+.pg-done { --s: var(--st-your-turn); } .pg-prog { --s: var(--st-running); } .pg-blocked { --s: var(--st-waiting); } .pg-todo { --s: var(--st-closed); }
+.next { margin: 0; padding: 14px 20px 14px 38px; }
+.next li { margin: 4px 0; overflow-wrap: anywhere; }
+.working .i { width: 20px; height: 20px; margin-bottom: 8px; color: var(--st-running); animation: spin 1.1s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .working .i { animation: none; } }
+
+/* tooltip, drawer, toast */
+.tip { position: fixed; z-index: 40; pointer-events: none; min-width: 150px; max-width: 280px; padding: 9px 11px; border-radius: 9px;
+  background: var(--surface); border: 1px solid var(--line-strong); box-shadow: var(--pop); font-size: 12.5px; }
+.tip-title { color: var(--ink-2); margin-bottom: 5px; }
+.tip-row { display: grid; grid-template-columns: 12px auto 1fr; gap: 8px; align-items: center; line-height: 1.7; }
+.tip-key { width: 12px; height: 2.5px; border-radius: 2px; }
+.tip-v { font-weight: 680; color: var(--ink); font-variant-numeric: tabular-nums; }
+.tip-k { color: var(--ink-2); }
+.tip-row.total { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--line); }
+.scrim { position: fixed; inset: 0; z-index: 20; background: rgba(10, 14, 20, .32); backdrop-filter: blur(1px); }
+.drawer { position: fixed; z-index: 21; top: 0; right: 0; bottom: 0; width: min(760px, 100vw); overflow-y: auto; background: var(--surface);
+  border-left: 1px solid var(--line); box-shadow: var(--pop); animation: slide .18s ease-out; }
+@keyframes slide { from { transform: translateX(24px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .drawer { animation: none; } }
+.d-wrap { padding: 22px 26px 48px; }
+.d-head { display: flex; align-items: flex-start; gap: 14px; }
+.d-title { flex: 1; min-width: 0; }
+.d-title h2 { margin: 0 0 6px; font-size: 19px; font-weight: 680; letter-spacing: -.015em; overflow-wrap: anywhere; }
+.d-sub { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; }
+.d-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 4px; }
+.drawer .callout { margin-top: 14px; }
+.kv { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 6px 14px; margin: 18px 0 0; padding: 14px 0 0; border-top: 1px solid var(--line); font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.drawer h3 { margin: 24px 0 8px; font-size: 13px; font-weight: 650; color: var(--ink-2); }
+.prompt { margin: 0; padding: 2px 0 2px 14px; border-left: 2px solid var(--line-strong); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 14em; overflow-y: auto; }
+.reply { padding: 14px 16px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 13.5px; line-height: 1.65; }
+.cmd { display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 14px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line); }
+.cmd code { flex: 1; overflow-wrap: anywhere; color: var(--ink-2); }
+.toast { position: fixed; z-index: 50; left: 50%; bottom: 28px; transform: translateX(-50%); display: flex; align-items: center; gap: 8px;
+  padding: 9px 14px; border-radius: 10px; background: var(--ink); color: var(--surface); font-size: 13px; font-weight: 560; box-shadow: var(--pop); }
+
+@media (max-width: 1180px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .kpi:nth-child(4) { border-left: 0; }
+  .kpi:nth-child(n+4) { border-top: 1px solid var(--line); }
+  .tr { grid-template-columns: minmax(0, 2.4fr) 118px minmax(0, 1.5fr) 56px; }
+  .tr > .cell-proj { display: none; }
+}
+@media (max-width: 900px) {
+  .app { display: block; }
+  .rail { position: sticky; z-index: 10; height: auto; flex-direction: row; align-items: center; gap: 12px; padding: 10px 16px;
+    border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .nav { flex-direction: row; }
+  .nav button { width: auto; white-space: nowrap; }
+  .nav button.active { box-shadow: inset 0 -2px 0 var(--ink); }
+  .rail-sec, .rail-foot { display: none; }
+  .main { padding: 20px 16px 64px; }
+  .grid-2 { grid-template-columns: minmax(0, 1fr); }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi:nth-child(odd) { border-left: 0; }
+  .kpi:nth-child(4) { border-left: 1px solid var(--line); }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--line); }
+  .item { grid-template-columns: 30px minmax(0, 1fr); padding: 16px; }
+  .item-actions { grid-column: 2; flex-direction: row; flex-wrap: wrap; margin-top: 10px; }
+  .tr { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; }
+  .tr.head { display: none; }
+  .tr > :nth-child(2) { grid-column: 2; grid-row: 1; }
+  .tr > .cell-step { grid-column: 1 / -1; padding-left: 42px; }
+  .tr > .cell-time { display: none; }
+  .d-wrap { padding: 18px 16px 40px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><i style="background: var(--rt-vscode)"></i><i style="background: var(--rt-claude-code)"></i><i style="background: var(--rt-codex-app)"></i><i style="background: var(--rt-claude-cli)"></i></span>aitop</div>
+    <nav class="nav" id="nav">
+      <button data-view="inbox"><svg class="i" viewBox="0 0 16 16"><path d="M2 9.5 3.8 3.6A1.5 1.5 0 0 1 5.2 2.5h5.6a1.5 1.5 0 0 1 1.4 1.1L14 9.5V12a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12z"/><path d="M2 9.5h3.2l.8 1.5h4l.8-1.5H14"/></svg>Needs you<span class="count" id="nav-count"></span></button>
+      <button data-view="week"><svg class="i" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12M5.5 1.8v2.4M10.5 1.8v2.4"/></svg>This week</button>
+      <button data-view="sessions"><svg class="i" viewBox="0 0 16 16"><path d="M5.5 4h8M5.5 8h8M5.5 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01"/></svg>All sessions</button>
+      <button data-view="insights"><svg class="i" viewBox="0 0 16 16"><path d="M2.5 13.5h11M4.5 11V8M8 11V4.5M11.5 11V6.5"/></svg>Insights</button>
+      <button data-view="briefs"><svg class="i" viewBox="0 0 16 16"><path d="M4 1.8h5.2L12.5 5v9a.7.7 0 0 1-.7.7H4a.7.7 0 0 1-.7-.7V2.5A.7.7 0 0 1 4 1.8z"/><path d="M9 1.8v3.5h3.5M5.6 8.3h4.8M5.6 11h3.2"/></svg>Briefings</button>
+    </nav>
+    <div class="rail-sec">
+      <div class="rail-label">Active by runtime</div>
+      <ul class="rt-list" id="rt-list"></ul>
+    </div>
+    <div class="rail-foot">
+      <div class="live" id="live"><span class="live-dot"></span><span id="updated">Connecting</span></div>
+      <label class="switch">Auto-refresh<input type="checkbox" id="auto" checked></label>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="page-head">
+      <div><h1 id="h-title">Needs you</h1><p id="h-sub">Loading sessions</p></div>
+      <div class="head-actions"><button class="btn" id="refresh"><svg class="i" viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>Refresh</button></div>
+    </header>
+    <div class="banner" id="error" hidden></div>
+    <section class="view" id="view-inbox"></section>
+    <section class="view" id="view-week" hidden></section>
+    <section class="view" id="view-sessions" hidden>
+      <div class="filters">
+        <label class="search"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m13.5 13.5-3.2-3.2"/></svg><input class="field" id="f-q" type="search" placeholder="Search name, prompt, step, project or id"></label>
+        <select class="field" id="f-rt" aria-label="Runtime"><option value="">All runtimes</option></select>
+        <select class="field" id="f-since" aria-label="Activity window">
+          <option value="1d">Active in the last day</option>
+          <option value="3d">Active in the last 3 days</option>
+          <option value="7d" selected>Active in the last 7 days</option>
+          <option value="30d">Active in the last 30 days</option>
+          <option value="">Any time</option>
+        </select>
+        <label class="check"><input type="checkbox" id="f-incl">Include closed and archived</label>
+      </div>
+      <div class="chips" id="f-chips"></div>
+      <div id="s-list"></div>
+    </section>
+    <section class="view" id="view-insights" hidden></section>
+    <section class="view" id="view-briefs" hidden></section>
+  </main>
+</div>
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Session details"></aside>
+<div class="tip" id="tip" hidden></div>
+<script>
+const $ = s => document.querySelector(s);
+const SVGNS = 'http://www.w3.org/2000/svg';
+const VIEWS = ['inbox', 'week', 'sessions', 'insights', 'briefs'];
+const STATUSES = ['waiting', 'running', 'your-turn', 'closed', 'archived'];
+const STATUS_LABEL = {waiting: 'Waiting', running: 'Running', 'your-turn': 'Your turn', closed: 'Closed', archived: 'Archived'};
+const RT_ORDER = ['vscode', 'claude-code', 'codex-app', 'claude-cli', 'codex-cli', 'codex-chrome', 'codex', 'claude-archive', 'other'];
+// [label, icon, app that owns the session view]; null app means it is resumed in a terminal.
+const RT = {
+  'vscode': ['Claude in VSCode', 'code', 'VSCode'],
+  'claude-code': ['Claude Desktop', 'spark', 'Claude'],
+  'codex-app': ['Codex app', 'hex', 'Codex'],
+  'claude-cli': ['Claude CLI', 'prompt', null],
+  'codex-cli': ['Codex CLI', 'hexprompt', null],
+  'codex-chrome': ['Codex in Chrome', 'globe', 'Codex'],
+  'codex': ['Codex, other clients', 'cube', 'Codex'],
+  'claude-archive': ['Claude, earlier history', 'clock', null],
+  'other': ['Other', 'dot', null],
+};
+const ICONS = {
+  code: '<path d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/>',
+  spark: '<path d="M8 2v12M2 8h12M3.8 3.8l8.4 8.4M12.2 3.8l-8.4 8.4"/>',
+  hex: '<path d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"/><circle cx="8" cy="8" r="1.7"/>',
+  prompt: '<rect x="1.8" y="2.8" width="12.4" height="10.4" rx="2"/><path d="m4.6 6.3 2 1.7-2 1.7M8.4 10h3"/>',
+  hexprompt: '<path d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"/><path d="m6.6 6.3 1.9 1.7-1.9 1.7"/>',
+  globe: '<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.7 1.7 2.5 3.8 2.5 6S9.7 12.3 8 14C6.3 12.3 5.5 10.2 5.5 8S6.3 3.7 8 2z"/>',
+  cube: '<path d="M8 1.8l5.5 3.2v6L8 14.2 2.5 11V5z"/><path d="M2.5 5 8 8.2 13.5 5M8 8.2v6"/>',
+  clock: '<circle cx="8" cy="8" r="6"/><path d="M8 4.8V8l2.2 1.4"/>',
+  dot: '<circle cx="8" cy="8" r="3"/>',
+  external: '<path d="M9.5 2.5h4v4M13.5 2.5 7.5 8.5M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/>',
+  copy: '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>',
+  check: '<path d="m3 8.5 3 3 7-7"/>',
+  close: '<path d="m4 4 8 8M12 4l-8 8"/>',
+  waiting: '<circle cx="8" cy="8" r="6"/><path d="M8 5v3.5M8 11h.01"/>',
+  running: '<path d="M8 2a6 6 0 1 1-6 6"/>',
+  'your-turn': '<path d="M2.5 4.5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H7.2L4.5 13.5v-2a2 2 0 0 1-2-2z"/>',
+  closed: '<circle cx="8" cy="8" r="6"/><path d="M5.5 8h5"/>',
+  archived: '<rect x="2" y="3" width="12" height="3" rx="1"/><path d="M3 6v6.5a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V6M6.5 9h3"/>',
+  left: '<path d="m10 3.5-4.5 4.5 4.5 4.5"/>',
+  right: '<path d="m6 3.5 4.5 4.5-4.5 4.5"/>',
+  refresh: '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/>',
+  write: '<path d="M10.8 2.7a1.6 1.6 0 0 1 2.3 2.3L6 12.2l-3 .8.8-3z"/>',
+};
+const RANGE_NAME = {'7d': '7 days', '30d': '30 days', '90d': '90 days', all: 'all time'};
+const state = {view: 'inbox', range: '30d', metric: 'all', rt: '', terminal: 'Ghostty', rows: [], stats: null,
+               briefKind: 'weekly', briefDate: new Date().toLocaleDateString('en-CA'),
+               statusOn: new Set(STATUSES)};
+let loading = false, again = false;
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false && kid !== '') el.append(kid);
+  return el;
+}
+function sv(tag, attrs, text) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  if (text != null) el.textContent = text;
+  return el;
+}
+function icon(name, cls) {
+  const el = sv('svg', {viewBox: '0 0 16 16', class: 'i' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true'});
+  el.innerHTML = ICONS[name] || ICONS.dot;  // static markup from ICONS, never session data
+  return el;
+}
+
+const rtKey = runtime => { const k = (runtime || '').split('/')[0]; return RT[k] ? k : 'other'; };
+const rtProvider = runtime => (runtime || '').split('/')[1] || '';
+const rtLabel = runtime => RT[rtKey(runtime)][0] + (rtProvider(runtime) ? `, ${rtProvider(runtime)}` : '');
+const compact = v => new Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1}).format(v);
+const fmtBytes = b => b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB` : `${Math.round(b / 2 ** 20)} MB`;
+const when = ms => new Date(ms).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+const fmtDay = iso => new Date(iso + 'T00:00').toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+const project = cwd => (cwd || '').split('/').filter(Boolean).pop() || '';
+const pad = n => String(n).padStart(2, '0');
+function ago(ms) {
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  for (const [u, n] of [['d', 86400], ['h', 3600], ['m', 60]]) if (s >= n) return Math.floor(s / n) + u;
+  return s + 's';
+}
+
+function fail(e) {
+  $('#error').textContent = e.message;
+  $('#error').hidden = false;
+}
+async function api(path, body) {
+  const init = body === undefined ? {} :
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
+  const res = await fetch(path, init);
+  const text = await res.text();
+  if (!res.ok) {
+    let msg = text;
+    try { msg = JSON.parse(text).error; } catch (_) { /* not JSON: show the raw body */ }
+    throw new Error(`${path} returned HTTP ${res.status}\n${msg}`);
+  }
+  return JSON.parse(text);
+}
+function toast(msg) {
+  const t = h('div', {class: 'toast', role: 'status'}, icon('check'), msg);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2200);
+}
+async function copy(text) {
+  await navigator.clipboard.writeText(text);
+  toast('Copied resume command');
+}
+async function ack(ids) {
+  if (!ids && !confirm('Mark every new reply as read?')) return;
+  const r = await api('/api/ack', ids ? {ids} : {all: true});
+  toast(r.acked === 1 ? 'Marked as read' : `Marked ${r.acked} sessions as read`);
+  load();
+}
+
+// Jumping to a session: VSCode, Claude Desktop and Codex own their session views; CLI sessions resume in a terminal.
+function appFor(r) {
+  const k = rtKey(r.runtime);
+  if (k === 'claude-cli' && r.live) return null;
+  return RT[k][2] || state.terminal;
+}
+function openVerb(r) {
+  const app = appFor(r);
+  if (!app) return 'Focus its terminal';
+  return ['VSCode', 'Claude', 'Codex'].includes(app) ? `Open in ${app}` : `Resume in ${app}`;
+}
+async function openSession(r, target) {
+  const res = await api('/api/open', {id: r.id, target: target || 'app'});
+  toast(`Opened in ${res.app}`);
+}
+
+function tile(runtime, small) {
+  const k = rtKey(runtime);
+  return h('span', {class: `tile rt-${k}${small ? ' sm' : ''}`, title: rtLabel(runtime)}, icon(RT[k][1]));
+}
+function statusPill(r, withAge) {
+  const age = withAge ? ` ${ago(r.status === 'waiting' ? r.since : r.last_active)}` : '';
+  return h('span', {class: 's-pill s-' + r.status}, icon(r.status), STATUS_LABEL[r.status] + age);
+}
+function titleLink(r) {
+  return h('button', {class: 'title-link', title: openVerb(r), onclick: e => { e.stopPropagation(); openSession(r).catch(fail); }},
+    h('span', {}, r.name), icon('external'));
+}
+function setHead(title, sub) {
+  $('#h-title').textContent = title;
+  $('#h-sub').textContent = sub;
+}
+function secHead(title, n, note, action) {
+  return h('div', {class: 'sec-head'}, h('h2', {}, title), n != null && h('span', {class: 'n'}, String(n)),
+    note && h('span', {class: 'note'}, note), action);
+}
+
+// ---- needs you
+function inboxItem(r) {
+  return h('article', {class: 'item'},
+    tile(r.runtime),
+    h('div', {class: 'item-body'},
+      h('div', {class: 'item-title'}, titleLink(r), statusPill(r, true)),
+      h('div', {class: 'meta'}, h('span', {}, rtLabel(r.runtime)), h('span', {title: r.cwd}, r.where),
+        h('span', {class: 'mono'}, r.id.slice(0, 8))),
+      r.detail && h('div', {class: 'callout'}, h('strong', {}, 'Needs you: '), r.detail),
+      h('div', {class: 'preview'}, r.reply || 'No reply text yet.')),
+    h('div', {class: 'item-actions'},
+      h('button', {class: 'btn primary', onclick: () => openSession(r).catch(fail)}, icon('external'), openVerb(r)),
+      r.status === 'your-turn' && h('button', {class: 'btn', onclick: () => ack([r.id]).catch(fail)}, icon('check'), 'Mark as read'),
+      h('button', {class: 'btn ghost', onclick: () => openDetail(r.id).catch(fail)}, 'Full reply')));
+}
+function renderInbox(c) {
+  const w = c.waiting.length, f = c.fresh.length;
+  setHead('Needs you', w || f ? `${w} waiting on a decision, ${f} new ${f === 1 ? 'reply' : 'replies'} in the last 7 days`
+    : 'Nothing is waiting on you');
+  $('#view-inbox').replaceChildren(
+    secHead('Waiting on a decision', w),
+    w ? h('div', {class: 'inbox'}, c.waiting.map(inboxItem))
+      : h('div', {class: 'empty'}, 'No agent is blocked on you. Permission prompts and questions show up here first.'),
+    secHead('New replies', f, null,
+      f > 0 && h('button', {class: 'btn', onclick: () => ack(null).catch(fail)}, icon('check'), 'Mark all as read')),
+    f ? h('div', {class: 'inbox'}, c.fresh.map(inboxItem))
+      : h('div', {class: 'empty'}, h('strong', {}, 'You are all caught up'), 'Finished turns from any agent appear here until you mark them as read.'));
+}
+
+// ---- session tables
+function sessionRow(r) {
+  const open = () => openDetail(r.id).catch(fail);
+  return h('div', {class: 'tr', tabindex: '0', onclick: open, onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) open(); }},
+    h('div', {class: 'cell-session'}, tile(r.runtime), h('div', {}, titleLink(r), h('div', {class: 'sub'}, r.brief || 'No prompt yet'))),
+    h('div', {}, statusPill(r)),
+    h('div', {class: 'cell-step', title: r.step}, r.step || '—'),
+    h('div', {class: 'cell-proj', title: r.cwd}, h('div', {}, project(r.cwd)), h('div', {class: 'sub'}, rtLabel(r.runtime))),
+    h('div', {class: 'cell-time', title: 'Last active ' + when(r.last_active)}, ago(r.last_active)));
+}
+function table(rows, empty) {
+  if (!rows.length) return h('div', {class: 'empty'}, empty);
+  return h('div', {class: 'table'},
+    h('div', {class: 'tr head'}, h('div', {}, 'Session'), h('div', {}, 'Status'), h('div', {}, 'Latest step'),
+      h('div', {class: 'cell-proj'}, 'Project'), h('div', {class: 'cell-time'}, 'Active')),
+    rows.map(sessionRow));
+}
+function renderWeek(w) {
+  const start = new Date(w.start).toLocaleDateString(undefined, {weekday: 'long', month: 'short', day: 'numeric'});
+  setHead('This week', `${w.new.length} sessions started since ${start}, ${w.resumed.length} older ones picked up again`);
+  $('#view-week').replaceChildren(
+    secHead('Started this week', w.new.length),
+    table(w.new, 'No session has started this week.'),
+    secHead('Picked up again', w.resumed.length, 'Created before this week and active since Monday'),
+    table(w.resumed, 'No older session was active this week.'));
+}
+function renderSessions(d) {
+  state.rows = d.rows;
+  const keys = RT_ORDER.filter(k => d.rows.some(r => rtKey(r.runtime) === k));
+  $('#f-rt').replaceChildren(h('option', {value: ''}, 'All runtimes'), ...keys.map(k => h('option', {value: k}, RT[k][0])));
+  $('#f-rt').value = keys.includes(state.rt) ? state.rt : '';
+  drawSessions();
+}
+function drawSessions() {
+  state.rt = $('#f-rt').value;
+  const q = $('#f-q').value.trim().toLowerCase();
+  const base = state.rows.filter(r => (!state.rt || rtKey(r.runtime) === state.rt) &&
+    (!q || [r.name, r.brief, r.step, r.cwd, r.id].join('\n').toLowerCase().includes(q)));
+  const counts = Object.fromEntries(STATUSES.map(s => [s, base.filter(r => r.status === s).length]));
+  $('#f-chips').replaceChildren(...STATUSES.filter(s => counts[s]).map(s => h('button', {
+    class: `s-pill s-${s} chip${state.statusOn.has(s) ? '' : ' off'}`, 'aria-pressed': String(state.statusOn.has(s)),
+    onclick: () => { state.statusOn.has(s) ? state.statusOn.delete(s) : state.statusOn.add(s); drawSessions(); }},
+    icon(s), `${STATUS_LABEL[s]} ${counts[s]}`)));
+  const rows = base.filter(r => state.statusOn.has(r.status));
+  $('#s-list').replaceChildren(table(rows, 'No sessions match these filters.'));
+  setHead('All sessions', `${rows.length} of ${state.rows.length} sessions shown`);
+  document.querySelectorAll('.rt-item').forEach(b => b.classList.toggle('on', b.dataset.rt === state.rt));
+}
+
+// ---- rail
+function renderRail(c) {
+  const need = c.waiting.length + c.fresh.length;
+  $('#nav-count').textContent = need || '';
+  document.title = need ? `(${need}) aitop` : 'aitop';
+  state.terminal = c.terminal;
+  const keys = RT_ORDER.filter(k => c.runtimes[k]);
+  $('#rt-list').replaceChildren(...keys.length ? keys.map(k => {
+    const n = c.runtimes[k];
+    return h('li', {}, h('button', {class: 'rt-item' + (state.view === 'sessions' && state.rt === k ? ' on' : ''), 'data-rt': k,
+      title: `${n.waiting} waiting, ${n.running} running, ${n['your-turn']} your turn`,
+      onclick: () => { state.rt = k; $('#f-rt').value = k; go('sessions'); }},
+      tile(k, true), h('span', {class: 'rt-name'}, RT[k][0]),
+      n.waiting > 0 && h('span', {class: 'rt-wait'}, String(n.waiting)),
+      h('span', {class: 'rt-n'}, String(n.waiting + n.running + n['your-turn']))));
+  }) : [h('li', {class: 'rail-label'}, 'No active sessions')]);
+}
+
+// ---- drawer
+async function openDetail(id) {
+  const d = await api('/api/session?id=' + encodeURIComponent(id));
+  const kv = (k, v) => [h('dt', {}, k), h('dd', {}, v)];
+  const app = appFor(d);
+  $('#drawer').replaceChildren(h('div', {class: 'd-wrap'},
+    h('div', {class: 'd-head'}, tile(d.runtime),
+      h('div', {class: 'd-title'}, h('h2', {}, d.name), h('div', {class: 'd-sub'}, statusPill(d, true), h('span', {}, rtLabel(d.runtime)))),
+      h('button', {class: 'btn ghost icon-only', 'aria-label': 'Close', onclick: closeDetail}, icon('close'))),
+    h('div', {class: 'd-actions'},
+      h('button', {class: 'btn primary', onclick: () => openSession(d).catch(fail)}, icon('external'), openVerb(d)),
+      ['VSCode', 'Claude', 'Codex'].includes(app) &&
+        h('button', {class: 'btn', onclick: () => openSession(d, 'terminal').catch(fail)}, icon('prompt'), `Resume in ${state.terminal}`),
+      d.status === 'your-turn' && h('button', {class: 'btn', onclick: () => ack([d.id]).then(closeDetail).catch(fail)}, icon('check'), 'Mark as read')),
+    d.detail && h('div', {class: 'callout'}, h('strong', {}, 'Needs you: '), d.detail),
+    h('dl', {class: 'kv'}, kv('Project', d.where), kv('Created', when(d.created)),
+      kv('Last active', `${when(d.last_active)}, ${ago(d.last_active)} ago`), kv('Session id', h('code', {}, d.id))),
+    d.last_prompt && [h('h3', {}, 'You asked'), h('blockquote', {class: 'prompt'}, d.last_prompt)],
+    h('h3', {}, 'Latest reply'), h('div', {class: 'reply'}, d.reply || 'No reply text yet.'),
+    h('h3', {}, 'Resume from a terminal'),
+    h('div', {class: 'cmd'}, h('code', {}, d.resume_cmd),
+      h('button', {class: 'btn ghost', onclick: () => copy(d.resume_cmd).catch(fail)}, icon('copy'), 'Copy'))));
+  $('#drawer').hidden = $('#scrim').hidden = false;
+  $('#drawer').scrollTop = 0;
+}
+function closeDetail() { $('#drawer').hidden = $('#scrim').hidden = true; }
+
+// ---- charts
+function niceScale(max, integer) {
+  if (max <= 0) return {top: 4, step: 1};
+  const raw = max / 4, mag = 10 ** Math.floor(Math.log10(raw));
+  let step = [1, 2, 2.5, 5, 10].map(f => f * mag).find(st => st >= raw);
+  if (integer) step = Math.max(1, Math.ceil(step));
+  return {top: Math.ceil(max / step) * step, step};
+}
+function colPath(x, y, w, hgt, r) {
+  return r > 0 ? `M${x},${y + hgt}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + hgt}Z`
+               : `M${x},${y + hgt}V${y}H${x + w}V${y + hgt}Z`;
+}
+function showTip(ev, kids) {
+  const t = $('#tip');
+  t.replaceChildren(...kids.flat().filter(Boolean));
+  t.hidden = false;
+  const r = t.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  t.style.left = x + 'px';
+  t.style.top = y + 'px';
+}
+function hideTip() { $('#tip').hidden = true; }
+function tipRows(title, entries, total, fmt) {
+  return [h('div', {class: 'tip-title'}, title),
+    entries.length ? entries.slice().reverse().map(([k, v]) => h('div', {class: 'tip-row'},
+      h('span', {class: 'tip-key', style: `background: var(--rt-${k})`}), h('span', {class: 'tip-v'}, fmt(v)), h('span', {class: 'tip-k'}, RT[k][0])))
+      : h('div', {class: 'tip-k'}, 'No activity'),
+    entries.length > 1 && h('div', {class: 'tip-row total'}, h('span', {}), h('span', {class: 'tip-v'}, fmt(total)), h('span', {class: 'tip-k'}, 'Total'))];
+}
+function stackedColumns(el, {keys, value, labels, titles, fmt, integer}) {
+  const W = Math.max(300, el.clientWidth), H = 230, m = {t: 8, r: 4, b: 26, l: 44};
+  const n = labels.length, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const totals = labels.map((_, i) => keys.reduce((a, k) => a + value(k, i), 0));
+  const {top, step} = niceScale(Math.max(0, ...totals), integer);
+  const y = v => m.t + ih - (v / top) * ih;
+  const band = iw / n, bw = Math.max(2, Math.min(24, band * 0.64));
+  const svg = sv('svg', {class: 'chart', width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img'});
+  for (let i = 0; i <= Math.round(top / step); i++) {
+    const t = i * step;
+    svg.append(sv('line', {x1: m.l, x2: W - m.r, y1: y(t), y2: y(t), class: i ? 'gridline' : 'baseline'}));
+    svg.append(sv('text', {x: m.l - 8, y: y(t) + 4, 'text-anchor': 'end', class: 'tick'}, fmt(t)));
+  }
+  const every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / 62))));
+  labels.forEach((label, i) => {
+    const x = m.l + band * i + (band - bw) / 2;
+    const g = sv('g', {class: 'col'});
+    g.append(sv('rect', {x: m.l + band * i, y: m.t, width: band, height: ih, class: 'hit'}));
+    const segs = keys.map(k => [k, value(k, i)]).filter(([, v]) => v > 0);
+    let acc = 0;
+    segs.forEach(([k, v], j) => {
+      const y0 = y(acc), y1 = y(acc + v);
+      acc += v;
+      const hgt = y0 - y1 - (j > 0 ? 2 : 0);  // 2px surface gap between stacked segments
+      if (hgt < 0.75) return;
+      const r = j === segs.length - 1 ? Math.min(4, hgt, bw / 2) : 0;
+      g.append(sv('path', {d: colPath(x, y1, bw, hgt, r), class: 'seg', style: `fill: var(--rt-${k})`}));
+    });
+    g.addEventListener('pointermove', ev => showTip(ev, tipRows(titles[i], segs, totals[i], fmt)));
+    g.addEventListener('pointerleave', hideTip);
+    svg.append(g);
+    if (i % every === 0) svg.append(sv('text', {x: m.l + band * i + band / 2, y: H - 7, 'text-anchor': 'middle', class: 'tick'}, label));
+  });
+  el.replaceChildren(svg);
+}
+function heatmap(el, heat) {
+  const W = Math.max(300, el.clientWidth), lw = 38, cw = (W - lw) / 24, ch = Math.min(26, Math.max(15, cw * 0.82)), H = ch * 7 + 24;
+  const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const max = Math.max(1, ...heat.flat());
+  const svg = sv('svg', {class: 'chart', width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Prompts by weekday and hour'});
+  heat.forEach((row, d) => {
+    svg.append(sv('text', {x: 0, y: d * ch + ch / 2 + 4, class: 'tick'}, days[d]));
+    row.forEach((v, hr) => {
+      const cell = sv('rect', {x: lw + hr * cw + 1, y: d * ch + 1, width: Math.max(1, cw - 2), height: ch - 2, rx: 3,
+        class: v ? 'cell' : 'cell zero', style: v ? `fill: rgb(var(--heat) / ${(0.12 + 0.88 * v / max).toFixed(3)})` : ''});
+      cell.addEventListener('pointermove', ev => showTip(ev, [h('div', {class: 'tip-title'}, `${days[d]}, ${pad(hr)}:00 to ${pad((hr + 1) % 24)}:00`),
+        h('div', {class: 'tip-row'}, h('span', {}), h('span', {class: 'tip-v'}, String(v)), h('span', {class: 'tip-k'}, v === 1 ? 'prompt' : 'prompts'))]));
+      cell.addEventListener('pointerleave', hideTip);
+      svg.append(cell);
+    });
+  });
+  [0, 6, 12, 18].forEach(hr => svg.append(sv('text', {x: lw + hr * cw + 1, y: H - 6, class: 'tick'}, `${pad(hr)}:00`)));
+  el.replaceChildren(svg, h('div', {class: 'ramp'}, 'Fewer',
+    [0.12, 0.34, 0.56, 0.78, 1].map(a => h('i', {style: `background: rgb(var(--heat) / ${a})`})), 'More', h('span', {class: 'spacer'}),
+    `Busiest hour: ${max} prompts`));
+}
+function hbars(items, fmt) {
+  if (!items.length) return h('div', {class: 'muted small'}, 'Nothing in this range.');
+  const max = Math.max(1, ...items.map(it => it.value));
+  return h('div', {class: 'hbars'}, items.map(it => h('div', {class: 'hb-row', title: it.title || it.label},
+    h('div', {class: 'hb-label'}, h('span', {class: 'hb-name'}, it.label), it.sub && h('span', {class: 'hb-sub'}, it.sub)),
+    h('div', {class: 'hb-track'}, h('div', {class: 'hb-bar', style: `width: ${(it.value / max * 100).toFixed(2)}%`})),
+    h('div', {class: 'hb-val'}, fmt(it.value)))));
+}
+
+// ---- insights
+const tokenValue = t => state.metric === 'all' ? t[0] + t[1] + t[2] : t[0] + t[2];
+function seg(options, current, onPick) {
+  return h('div', {class: 'seg', role: 'group'}, options.map(([v, label]) =>
+    h('button', {class: v === current ? 'on' : '', 'aria-pressed': String(v === current), onclick: () => onPick(v)}, label)));
+}
+function legend(keys, totalOf, fmt) {
+  return h('div', {class: 'legend'}, keys.map(k => h('span', {}, tile(k, true), RT[k][0], h('b', {}, fmt(totalOf(k))))));
+}
+function kpiStrip(s) {
+  const tiles = [['sessions', 'Sessions started'], ['prompts', 'Prompts sent'], ['tokens', 'Tokens used'],
+                 ['tools', 'Tool calls'], ['edits', 'Files edited'], ['prs', 'PRs and MRs linked']];
+  return h('div', {class: 'kpis'}, tiles.map(([k, label]) => {
+    const [cur, prev] = s.kpi[k];
+    let delta = '';
+    if (k === 'tokens') delta = `${compact(s.kpi.fresh[0])} without cache reads`;
+    else if (s.has_prev) delta = !prev ? (cur ? 'None in the period before' : 'None in either period')
+      : `${cur >= prev ? '▲' : '▼'} ${Math.abs(Math.round((cur - prev) / prev * 100))}%, was ${compact(prev)}`;
+    return h('div', {class: 'kpi'}, h('div', {class: 'kpi-label'}, label),
+      h('div', {class: 'kpi-value', title: cur.toLocaleString()}, compact(cur)), h('div', {class: 'kpi-delta'}, delta));
+  }));
+}
+function renderInsights(s) {
+  state.stats = s;
+  if (s.archive_until) RT['claude-archive'][0] = `Claude before ${fmtDay(s.archive_until)}`;
+  setHead('Insights', s.range === 'all' ? 'Everything aitop has indexed, grouped by week'
+    : `The last ${RANGE_NAME[s.range]} across every runtime, compared with the ${RANGE_NAME[s.range]} before`);
+  const sum = arr => arr.reduce((a, b) => a + b, 0);
+  const sessionKeys = s.runtimes.filter(k => s.sessions[k]);
+  const tokenKeys = s.runtimes.filter(k => s.tokens[k]);
+  const metricNote = state.metric === 'all' ? 'Input, cache reads and output' : 'Input and output, cache reads left out';
+  const models = s.models.map(([model, fresh, cached, out]) => ({label: model, value: tokenValue([fresh, cached, out])}))
+    .sort((a, b) => b.value - a.value);
+  const projects = s.projects.map(p => ({label: p.name, title: p.cwd, value: state.metric === 'all' ? p.tokens : p.fresh,
+    sub: p.sessions ? `${p.sessions} sessions, ${p.prompts} prompts` : 'Subagent and review runs only'})).sort((a, b) => b.value - a.value);
+  const per = s.bucket === 'week' ? 'per week' : 'per day';
+  const sessionsAt = i => sum(sessionKeys.map(k => s.sessions[k][i]));
+  const tokensAt = (i, metric) => sum(tokenKeys.map(k => { const t = s.tokens[k][i]; return metric === 'all' ? t[0] + t[1] + t[2] : t[0] + t[2]; }));
+  $('#view-insights').replaceChildren(
+    h('div', {class: 'filters'},
+      seg([['7d', '7 days'], ['30d', '30 days'], ['90d', '90 days'], ['all', 'All time']], s.range,
+        v => { state.range = v; load(); }),
+      h('span', {class: 'spacer'}),
+      h('span', {class: 'muted small'}, `${s.indexed.files} transcripts indexed, ${fmtBytes(s.indexed.bytes)}`)),
+    kpiStrip(s),
+    h('section', {class: 'panel'},
+      h('div', {class: 'panel-head'}, h('h3', {}, 'Sessions started'), h('p', {}, `New sessions ${per}, by runtime`)),
+      h('div', {id: 'c-sessions'}),
+      legend(sessionKeys, k => sum(s.sessions[k]), v => String(v)),
+      s.archive_until && sessionKeys.includes('claude-archive') && h('p', {class: 'foot-note'},
+        `Claude sessions before ${fmtDay(s.archive_until)} come from Claude Code's own stats cache, because their transcripts were cleaned up. That cache has no runtime or token detail.`)),
+    h('section', {class: 'panel'},
+      h('div', {class: 'panel-head'}, h('h3', {}, 'Token usage'), h('p', {}, `${metricNote}, ${per}`),
+        seg([['all', 'All tokens'], ['fresh', 'Without cache reads']], state.metric, v => { state.metric = v; renderInsights(s); })),
+      h('div', {id: 'c-tokens'}),
+      legend(tokenKeys, k => sum(s.tokens[k].map(tokenValue)), compact)),
+    h('div', {class: 'grid-2'},
+      h('section', {class: 'panel'}, h('div', {class: 'panel-head'}, h('h3', {}, 'When you prompt'), h('p', {}, 'Prompts by weekday and hour, local time')),
+        h('div', {id: 'c-heat'})),
+      h('section', {class: 'panel'}, h('div', {class: 'panel-head'}, h('h3', {}, 'Tokens by model'), h('p', {}, metricNote)),
+        hbars(models, compact))),
+    h('div', {class: 'grid-2'},
+      h('section', {class: 'panel'}, h('div', {class: 'panel-head'}, h('h3', {}, 'Top projects'), h('p', {}, 'Ranked by tokens')),
+        hbars(projects, compact)),
+      h('section', {class: 'panel'}, h('div', {class: 'panel-head'}, h('h3', {}, 'Linked PRs and MRs'), h('p', {}, 'Opened from a Claude session')),
+        s.prs.length ? h('div', {class: 'prs'}, s.prs.map(p => h('a', {class: 'pr', href: p.url, target: '_blank', rel: 'noopener noreferrer'},
+          h('span', {class: 'pr-ref'}, (p.url.includes('merge_requests') ? '!' : '#') + p.number),
+          h('span', {class: 'pr-repo'}, p.repo || p.url), h('span', {class: 'pr-date'}, when(p.ts * 1000)))))
+          : h('div', {class: 'muted small'}, 'No PR or MR was linked in this range.'))),
+    h('details', {class: 'panel'}, h('summary', {}, 'Data table'),
+      h('table', {class: 'data'},
+        h('thead', {}, h('tr', {}, ['Period', 'Sessions', 'Prompts', 'All tokens', 'Without cache reads'].map(t => h('th', {}, t)))),
+        h('tbody', {}, s.buckets.map((b, i) => h('tr', {},
+          h('td', {}, s.bucket === 'week' ? `Week of ${fmtDay(b)}` : fmtDay(b)), h('td', {}, String(sessionsAt(i))),
+          h('td', {}, String(s.prompts[i])), h('td', {}, tokensAt(i, 'all').toLocaleString()), h('td', {}, tokensAt(i, 'fresh').toLocaleString())))))));
+  drawCharts();
+}
+function drawCharts() {
+  const s = state.stats;
+  if (!s || state.view !== 'insights' || !$('#c-sessions')) return;
+  const labels = s.buckets.map(fmtDay);
+  const titles = s.buckets.map(b => s.bucket === 'week' ? `Week of ${fmtDay(b)}` : new Date(b + 'T00:00').toLocaleDateString(undefined, {weekday: 'short', month: 'short', day: 'numeric'}));
+  stackedColumns($('#c-sessions'), {keys: s.runtimes.filter(k => s.sessions[k]), value: (k, i) => s.sessions[k][i],
+    labels, titles, fmt: v => String(v), integer: true});
+  stackedColumns($('#c-tokens'), {keys: s.runtimes.filter(k => s.tokens[k]), value: (k, i) => tokenValue(s.tokens[k][i]),
+    labels, titles, fmt: compact});
+  heatmap($('#c-heat'), s.heat);
+}
+
+// ---- briefings
+const PROGRESS = {'done': ['Done', 'check', 'done'], 'in progress': ['In progress', 'running', 'prog'],
+                  'blocked': ['Blocked', 'waiting', 'blocked'], 'not started': ['Not started', 'closed', 'todo']};
+const addDays = (iso, n) => { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+let briefPoll = null;
+function linkify(text) {
+  return String(text).split(/(https?:\/\/[^\s<>()，；、]+)/).map((part, i) =>
+    i % 2 ? h('a', {href: part, target: '_blank', rel: 'noopener noreferrer'}, part) : part);
+}
+function progressPill(p) {
+  const [label, ic, cls] = PROGRESS[(p || '').toLowerCase()] || [p || 'Unknown', 'dot', 'todo'];
+  return h('span', {class: 's-pill pg-' + cls}, icon(ic), label);
+}
+function sessionChip(b, id8) {
+  const s = b.sessions[id8];
+  if (!s) return h('span', {class: 'chip-s mono'}, id8);
+  return h('button', {class: 'chip-s', title: `${s.name} (${rtLabel(s.runtime)})`, onclick: () => openDetail(s.id).catch(fail)},
+    tile(s.runtime, true), h('span', {}, s.name));
+}
+function taskRow(b, t) {
+  const list = (label, items, cls) => (items || []).length > 0 &&
+    h('div', {class: 'task-list ' + cls}, h('span', {class: 'tl-label'}, label), h('ul', {}, items.map(x => h('li', {}, linkify(x)))));
+  return h('div', {class: 'task'},
+    h('div', {class: 'task-head'}, progressPill(t.progress), h('span', {class: 'task-title'}, t.title)),
+    t.summary && h('p', {class: 'task-sum'}, linkify(t.summary)),
+    list('Outputs', t.outputs, 'out'), list('To do', t.todos, 'todo'),
+    (t.sessions || []).length > 0 && h('div', {class: 'task-sessions'}, t.sessions.map(id => sessionChip(b, id))));
+}
+function briefBody(b) {
+  const r = b.report, s = b.stats;
+  const cats = (r.categories || []).map(c => ({...c, projects: (c.projects || []).filter(p => (p.tasks || []).length)}))
+    .filter(c => c.projects.length);
+  return [
+    h('p', {class: 'headline'}, r.headline || ''),
+    h('p', {class: 'muted small'}, `Written ${when(b.generated_at * 1000)} by ${b.command} from a ${compact(b.digest_chars)}-character digest`),
+    h('div', {class: 'bstats'}, [['sessions', s.sessions], ['prompts', s.prompts], ['files edited', s.edits], ['PRs and MRs', s.prs]]
+      .map(([label, v]) => h('div', {}, h('b', {}, String(v)), label))),
+    cats.map(c => [
+      secHead(c.name, c.projects.reduce((a, p) => a + p.tasks.length, 0)),
+      h('div', {class: 'brief-panel'}, c.projects.map(p => h('div', {class: 'proj'}, h('h3', {}, p.name), p.tasks.map(t => taskRow(b, t)))))]),
+    (r.next_steps || []).length > 0 && [secHead('Next steps'),
+      h('div', {class: 'brief-panel'}, h('ul', {class: 'next'}, r.next_steps.map(x => h('li', {}, linkify(x)))))],
+    (r.skipped || []).length > 0 && h('p', {class: 'foot-note'},
+      `${r.skipped.length} personal ${r.skipped.length === 1 ? 'session was' : 'sessions were'} left out.`)];
+}
+async function writeBrief(st) {
+  await api('/api/brief', {kind: st.kind, date: st.start});
+  load(true);
+}
+function renderBriefs(st) {
+  clearTimeout(briefPoll);
+  const b = st.brief, job = st.job, running = job && job.state === 'running';
+  const atLatest = st.end > st.today;
+  setHead('Briefings', `${st.label}. ${st.active} ${st.active === 1 ? 'session' : 'sessions'} with prompts in this period.`);
+  const controls = h('div', {class: 'filters'},
+    seg([['daily', 'Day'], ['weekly', 'Week'], ['monthly', 'Month']], st.kind, v => { state.briefKind = v; load(); }),
+    h('div', {class: 'period'},
+      h('button', {class: 'btn icon-only', 'aria-label': 'Previous period', onclick: () => { state.briefDate = addDays(st.start, -1); load(); }}, icon('left')),
+      h('span', {class: 'period-label'}, st.label),
+      h('button', {class: 'btn icon-only', 'aria-label': 'Next period', ...(atLatest ? {disabled: ''} : {}),
+        onclick: () => { state.briefDate = st.end; load(); }}, icon('right'))),
+    !atLatest && h('button', {class: 'btn ghost', onclick: () => { state.briefDate = st.today; load(); }}, 'Back to current'),
+    h('span', {class: 'spacer'}),
+    b && h('button', {class: 'btn', onclick: () => navigator.clipboard.writeText(st.markdown).then(() => toast('Copied briefing as Markdown')).catch(fail)},
+      icon('copy'), 'Copy as Markdown'),
+    st.active > 0 && h('button', {class: b ? 'btn' : 'btn primary', ...(running ? {disabled: ''} : {}), onclick: () => writeBrief(st).catch(fail)},
+      icon(b ? 'refresh' : 'write'), b ? 'Rewrite' : 'Write briefing'));
+  let body;
+  if (running) {
+    body = h('div', {class: 'empty working'}, icon('running'),
+      h('strong', {}, `Writing the ${st.kind} briefing from ${st.active} sessions, ${Math.max(0, Math.round(Date.now() / 1000 - job.started))}s so far`),
+      'A day usually takes under a minute and a month a few minutes. You can leave this page; the result is saved.');
+    briefPoll = setTimeout(() => { if (state.view === 'briefs') load(true); }, 3000);
+  } else if (b) {
+    body = briefBody(b);
+  } else if (st.active) {
+    body = h('div', {class: 'empty'}, h('strong', {}, `No briefing for ${st.label} yet`),
+      `Write one to group the work from ${st.active} sessions by category, project and task, with progress, outputs and to-dos.`);
+  } else {
+    body = h('div', {class: 'empty'}, h('strong', {}, 'Nothing to brief'), `No session had a prompt in ${st.label}.`);
+  }
+  $('#view-briefs').replaceChildren(controls,
+    job && job.state === 'failed' ? h('div', {class: 'banner'}, `The last attempt failed. ${job.error}`) : '',
+    h('div', {}, body));
+}
+
+// ---- loading and navigation
+async function load(quiet) {
+  if (loading) { again = true; return; }
+  loading = true;
+  const view = $('#view-' + state.view);
+  if (state.view === 'insights' && !state.stats)
+    view.replaceChildren(h('div', {class: 'empty'}, h('strong', {}, 'Indexing session history'),
+      'The first run reads every transcript once and can take about 15 seconds. Later visits only read what changed.'));
+  if (!quiet) view.classList.add('busy');
+  try {
+    const c = await api('/api/catchup?since=7d');
+    renderRail(c);
+    if (state.view === 'inbox') renderInbox(c);
+    else if (state.view === 'week') renderWeek(await api('/api/week'));
+    else if (state.view === 'sessions')
+      renderSessions(await api(`/api/list?all=${$('#f-incl').checked ? 1 : 0}&since=${encodeURIComponent($('#f-since').value)}`));
+    else if (state.view === 'briefs') renderBriefs(await api(`/api/brief?kind=${state.briefKind}&date=${state.briefDate}`));
+    else renderInsights(await api('/api/stats?range=' + state.range));
+    $('#error').hidden = true;
+    $('#updated').textContent = 'Updated ' + new Date().toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  } catch (e) {
+    fail(e);
+  } finally {
+    view.classList.remove('busy');
+    loading = false;
+    if (again) { again = false; load(); }
+  }
+}
+function go(v) {
+  state.view = v;
+  history.replaceState(null, '', '#' + v);
+  document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
+  VIEWS.forEach(x => { $('#view-' + x).hidden = x !== v; });
+  closeDetail();
+  load();
+}
+
+document.querySelectorAll('#nav button').forEach(b => b.addEventListener('click', () => go(b.dataset.view)));
+$('#refresh').addEventListener('click', () => load());
+$('#f-q').addEventListener('input', drawSessions);
+$('#f-rt').addEventListener('change', drawSessions);
+$('#f-since').addEventListener('change', () => load());
+$('#f-incl').addEventListener('change', () => load());
+$('#scrim').addEventListener('click', closeDetail);
+$('#auto').addEventListener('change', () => $('#live').classList.toggle('on', $('#auto').checked));
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDetail();
+  if (e.key === '/' && state.view === 'sessions' && document.activeElement !== $('#f-q')) { e.preventDefault(); $('#f-q').focus(); }
+});
+let resizeTimer;
+new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawCharts, 120); }).observe($('.main'));
+setInterval(() => {
+  // Insights and briefings change slowly and are costly to compute, so they refresh on demand.
+  if ($('#auto').checked && document.visibilityState === 'visible' && $('#drawer').hidden && !['insights', 'briefs'].includes(state.view)) load();
+}, 20000);
+$('#live').classList.add('on');
+const legacy = {catchup: 'inbox', all: 'sessions'};
+const initial = legacy[location.hash.slice(1)] || location.hash.slice(1);
+go(VIEWS.includes(initial) ? initial : 'inbox');
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='aitop', description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd')
+    p_list = sub.add_parser('list', help='table of sessions (default command)')
+    p_list.add_argument('--all', action='store_true', help='include closed and archived sessions')
+    p_list.add_argument('--since', type=parse_since,
+                        help='activity window, e.g. 30m, 12h, 7d (default 7d; no window with --all)')
+    p_list.add_argument('--runtime', help='prefix filter: vscode, claude-cli, claude-code, codex, codex-app ...')
+    p_catch = sub.add_parser('catchup', help='sessions waiting on you, with the latest reply')
+    sub.add_parser('week', help='sessions created or active since Monday 00:00')
+    p_show = sub.add_parser('show', help='full latest reply of one session; marks it seen')
+    p_show.add_argument('id', help='session id prefix')
+    p_ack = sub.add_parser('ack', help='mark sessions seen so catchup stops listing them')
+    p_ack.add_argument('ids', nargs='*', help='session id prefixes')
+    p_ack.add_argument('--all', action='store_true', help='ack every session in the default view')
+    for p in (p_catch, p_ack):
+        p.add_argument('--since', type=parse_since, default=parse_since('7d'),
+                       help='activity window, e.g. 30m, 12h, 7d (default 7d)')
+    p_serve = sub.add_parser('serve', help='web portal on http://127.0.0.1:<port>/')
+    p_serve.add_argument('--port', type=int, default=8765)
+    p_brief = sub.add_parser('brief', help='work briefing for a day, week or month, as Markdown')
+    p_brief.add_argument('kind', nargs='?', default='weekly', choices=BRIEF_KINDS)
+    p_brief.add_argument('--date', type=parse_day, default=date.today(), help='any day inside the period (default today)')
+    p_brief.add_argument('--regenerate', action='store_true', help='write it again even if one is cached')
+    commands = {'list': cmd_list, 'catchup': cmd_catchup, 'week': cmd_week, 'show': cmd_show,
+                'ack': cmd_ack, 'serve': cmd_serve, 'brief': cmd_brief}
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in (*commands, '-h', '--help'):
+        argv = ['list'] + argv
+    args = ap.parse_args(argv)
+    try:
+        commands[args.cmd](args)
+    except NotFound as e:
+        sys.exit(f'aitop: {e}')
+
+
+if __name__ == '__main__':
+    main()
