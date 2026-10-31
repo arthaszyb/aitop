@@ -4,7 +4,7 @@
 
 Claude Code and Codex each keep their sessions in their own stores, and every client shows only a slice. The VSCode panel lists the current folder's sessions, the desktop apps list their own, and Codex hides threads that ran on a different model provider. `aitop` reads all of those stores directly and merges them. It is a single Python file with no dependencies.
 
-![Needs you: sessions blocked on a decision first, then new replies](docs/screenshots/needs-you.png)
+![Workbench: sessions blocked on a decision first, then running sessions and new replies](docs/screenshots/workbench.png)
 
 The screenshots in this README come from the bundled demo data, so every name in them is made up.
 
@@ -59,13 +59,19 @@ aitop --version
 
 ## Portal
 
-`aitop serve` starts a local web app with five views.
+`aitop serve` starts a local web app with four views, reached from a floating glass bar at the top of the page. The bar also holds the last-update time, the auto-refresh switch, a light/dark toggle and a refresh button.
 
-- **Needs you** lists blocked sessions first, then new replies, each with a preview of the reply.
-- **This week** splits sessions started this week from older sessions that were active again.
-- **All sessions** is a searchable table with runtime and status filters.
+- **Workbench** has an app strip first: one card per app with active sessions, showing how many are waiting and how many are active. Clicking a card opens All sessions filtered to that app. Below it, three zones:
+  - **Waiting on a decision**: blocked sessions with the question and a preview of the reply.
+  - **Running**: sessions the agent is working on, each with its latest step and your last prompt.
+  - **New replies**: finished turns you have not marked as read. Sub tabs filter by app, and the Project and Topic selects narrow it further. Every count matches what the list shows after you pick it, and the mark-as-read button acts on exactly the replies on screen (`Mark all as read`, or `Mark 3 as read` when filtered).
+- **All sessions** is a searchable table in one filter panel: a When select, App, Project and Topic selects, an "Include closed and archived" switch, and status chips. The When select covers today, this week, the last 3, 7 or 30 days and any time. It also covers what the old This week view showed: sessions started this week, and older sessions picked up again this week.
 - **Insights** shows sessions started, prompts, token use by runtime and by model, a weekday-by-hour activity heatmap, top projects, and linked pull or merge requests, for the last 7, 30 or 90 days or all time.
 - **Briefings** writes daily, weekly or monthly work reports, described below.
+
+A session's topic is the category the newest cached briefing filed it under. Sessions that no briefing mentions have no topic, and the Topic selects stay hidden until at least one session has one.
+
+The portal is dark by default, on a frosted-glass look with a monochrome frame. Colour is kept for the data: runtime icons, session status and chart series. The toggle in the top bar switches to a light theme and remembers the choice in the browser. The page respects reduced-motion and reduced-transparency settings.
 
 ![Insights: sessions and token use by runtime, activity heatmap, top projects](docs/screenshots/insights.png)
 

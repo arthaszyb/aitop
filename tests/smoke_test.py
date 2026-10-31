@@ -90,6 +90,27 @@ def main():
                      '/api/brief?kind=weekly'):
             status, body = get(path)
             check(status == 200 and json.loads(body), f'GET {path}')
+        status, body = get('/api/catchup?since=7d')
+        check(status == 200 and len(json.loads(body)['running']) > 0, 'catchup lists the running sessions')
+        status, body = get('/api/list?all=1')
+        rows = json.loads(body)['rows']
+        check(all(r['topic'] == '' for r in rows), 'sessions have no topic before any briefing exists')
+        # A briefing names sessions by their 8-character id prefix; its category becomes their topic.
+        sid = rows[0]['id']
+        os.makedirs(a.BRIEF_DIR, exist_ok=True)
+        with open(os.path.join(a.BRIEF_DIR, 'weekly-2026-01-05.json'), 'w') as f:
+            json.dump({'generated_at': 1, 'report': {'priorities': [{'name': 'Old topic', 'projects': [
+                {'name': 'p', 'tasks': [{'title': 't', 'sessions': [sid[:8]]}]}]}]}}, f)
+        with open(os.path.join(a.BRIEF_DIR, 'weekly-2026-01-12.json'), 'w') as f:
+            json.dump({'generated_at': 2, 'report': {'priorities': [{'name': 'Business reliability', 'projects': [
+                {'name': 'p', 'tasks': [{'title': 't', 'sessions': [sid[:8]]}]}]}]}}, f)
+        status, body = get('/api/list?all=1')
+        topics = {r['id']: r['topic'] for r in json.loads(body)['rows']}
+        check(topics[sid] == 'Business reliability', 'the newest briefing sets the topic of a session')
+        check(sum(bool(t) for t in topics.values()) == 1, 'sessions outside every briefing have an empty topic')
+        status, body = get('/api/catchup?since=7d')
+        c = json.loads(body)
+        check(all('topic' in r for r in c['waiting'] + c['running'] + c['fresh']), 'catchup rows carry a topic')
         status, _ = get('/api/week', host='evil.example')
         check(status == 403, 'requests for another Host are refused')
         server.shutdown()
