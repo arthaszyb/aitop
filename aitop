@@ -2118,7 +2118,7 @@ const RANGE_NAME = {'7d': '7 days', '30d': '30 days', '90d': '90 days', all: 'al
 const state = {view: 'workbench', range: '30d', metric: 'all', rt: '', project: '', topic: '', terminal: 'Ghostty', rows: [], stats: null,
                fresh: {rt: '', project: '', topic: ''}, briefKind: 'weekly', briefDate: new Date().toLocaleDateString('en-CA'),
                statusOn: new Set(STATUSES)};
-let loading = false, again = false;
+let loading = false, again = false, lastSnapshot = '';
 
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -2157,6 +2157,8 @@ function ago(ms) {
   for (const [u, n] of [['d', 86400], ['h', 3600], ['m', 60]]) if (s >= n) return Math.floor(s / n) + u;
   return s + 's';
 }
+// An age that keeps counting between refreshes: the ticker at the bottom rewrites every [data-ago] each second.
+const liveAgo = ms => h('span', {'data-ago': String(ms)}, ago(ms));
 
 function fail(e) {
   $('#error').textContent = e.message;
@@ -2211,8 +2213,8 @@ function tile(runtime, small) {
   return h('span', {class: `tile rt-${k}${small ? ' sm' : ''}`, title: rtLabel(runtime)}, icon(RT[k][1]));
 }
 function statusPill(r, withAge) {
-  const age = withAge ? ` ${ago(r.status === 'waiting' ? r.since : r.last_active)}` : '';
-  return h('span', {class: 's-pill s-' + r.status}, icon(r.status), STATUS_LABEL[r.status] + age);
+  return h('span', {class: 's-pill s-' + r.status}, icon(r.status), STATUS_LABEL[r.status],
+    withAge && [' ', liveAgo(r.status === 'waiting' ? r.since : r.last_active)]);
 }
 function titleLink(r) {
   return h('button', {class: 'title-link', title: openVerb(r), onclick: e => { e.stopPropagation(); openSession(r).catch(fail); }},
@@ -2338,7 +2340,7 @@ function sessionRow(r) {
     h('div', {}, statusPill(r)),
     h('div', {class: 'cell-step' + (r.error ? ' err' : ''), title: r.step}, r.step || '—'),
     h('div', {class: 'cell-proj', title: r.cwd}, h('div', {}, project(r.cwd)), h('div', {class: 'sub'}, rtLabel(r.runtime) + (r.topic ? ` · ${r.topic}` : ''))),
-    h('div', {class: 'cell-time', title: 'Last active ' + when(r.last_active)}, ago(r.last_active)));
+    h('div', {class: 'cell-time', title: 'Last active ' + when(r.last_active)}, liveAgo(r.last_active)));
 }
 function table(rows, empty) {
   if (!rows.length) return h('div', {class: 'empty'}, empty);
@@ -2718,12 +2720,22 @@ async function load(quiet) {
   if (!quiet) view.classList.add('busy');
   try {
     const c = await api('/api/catchup?since=7d');
-    renderTop(c);
-    if (state.view === 'workbench') renderWorkbench(c);
-    else if (state.view === 'sessions')
-      renderSessions(await api(`/api/list?all=${$('#f-incl').checked ? 1 : 0}&since=${encodeURIComponent(WHEN[$('#f-since').value][1]())}`));
-    else if (state.view === 'briefs') renderBriefs(await api(`/api/brief?kind=${state.briefKind}&date=${state.briefDate}`));
-    else renderInsights(await api('/api/stats?range=' + state.range));
+    let d = null;
+    if (state.view === 'sessions')
+      d = await api(`/api/list?all=${$('#f-incl').checked ? 1 : 0}&since=${encodeURIComponent(WHEN[$('#f-since').value][1]())}`);
+    else if (state.view === 'briefs') d = await api(`/api/brief?kind=${state.briefKind}&date=${state.briefDate}`);
+    else if (state.view === 'insights') d = await api('/api/stats?range=' + state.range);
+    // A quiet refresh that brings nothing new leaves the DOM alone, so the glass does not repaint.
+    // Briefings always render: that is where their progress poll is rescheduled.
+    const snapshot = JSON.stringify([state.view, c, d]);
+    if (!quiet || snapshot !== lastSnapshot || state.view === 'briefs') {
+      lastSnapshot = snapshot;
+      renderTop(c);
+      if (state.view === 'workbench') renderWorkbench(c);
+      else if (state.view === 'sessions') renderSessions(d);
+      else if (state.view === 'briefs') renderBriefs(d);
+      else renderInsights(d);
+    }
     $('#error').hidden = true;
     $('#updated').textContent = 'Updated ' + new Date().toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', second: '2-digit'});
   } catch (e) {
@@ -2769,8 +2781,9 @@ let resizeTimer;
 new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawCharts, 120); }).observe($('.main'));
 setInterval(() => {
   // Insights and briefings change slowly and are costly to compute, so they refresh on demand.
-  if ($('#auto').checked && document.visibilityState === 'visible' && $('#drawer').hidden && !['insights', 'briefs'].includes(state.view)) load();
+  if ($('#auto').checked && document.visibilityState === 'visible' && $('#drawer').hidden && !['insights', 'briefs'].includes(state.view)) load(true);
 }, 20000);
+setInterval(() => document.querySelectorAll('[data-ago]').forEach(el => { el.textContent = ago(+el.dataset.ago); }), 1000);
 $('#live').classList.add('on');
 const legacy = {inbox: 'workbench', catchup: 'workbench', week: 'sessions', all: 'sessions'};
 const initial = legacy[location.hash.slice(1)] || location.hash.slice(1);
