@@ -370,12 +370,16 @@ def codex_step(payload):
     return f'{name}: {first_line(detail)}' if detail.strip() else name
 
 
+TASK_EVENTS = ('task_started', 'task_complete', 'turn_aborted')
+
+
 def codex_tail(path):
-    info = {'running': False, 'step': '', 'reply': '', 'last_prompt': ''}
+    info = {'running': False, 'started': None, 'step': '', 'reply': '', 'last_prompt': ''}
     if not os.path.exists(path):
         info['step'] = '(rollout file missing)'
         return info
-    records = read_tail_until(path, lambda rs: any(r.get('type') in ('response_item', 'event_msg') for r in rs),
+    # Read back to the latest task event, so a long running turn still has its task_started (and start time).
+    records = read_tail_until(path, lambda rs: any((r.get('payload') or {}).get('type') in TASK_EVENTS for r in rs),
                               start=256 * 1024)
     for rec in records:
         p = rec.get('payload') or {}
@@ -383,6 +387,7 @@ def codex_tail(path):
         if rec.get('type') == 'event_msg':
             if t == 'task_started':
                 info['running'] = True
+                info['started'] = iso_ms(rec['timestamp'])
             elif t == 'task_complete':
                 info['running'] = False
                 if p.get('last_agent_message'):
@@ -483,7 +488,9 @@ def load_codex(cutoff, include_all, id_prefix):
         else:
             status = 'your-turn'
         rows.append({
-            'key': f'codex:{tid}', 'id': tid, 'status': status, 'detail': '', 'since': updated,
+            # A running turn counts from its task_started; started is None only past read_tail_until's 8MB limit.
+            'key': f'codex:{tid}', 'id': tid, 'status': status, 'detail': '',
+            'since': tail['started'] or updated if status == 'running' else updated,
             'live': status == 'running', 'runtime': runtime,
             'name': codex_request(title), 'brief': codex_request(first_msg), 'step': tail['step'],
             'last_active': updated, 'created': created, 'cwd': cwd, 'focused': 0, 'reply': tail['reply'],
@@ -2214,7 +2221,7 @@ function tile(runtime, small) {
 }
 function statusPill(r, withAge) {
   return h('span', {class: 's-pill s-' + r.status}, icon(r.status), STATUS_LABEL[r.status],
-    withAge && [' ', liveAgo(r.status === 'waiting' ? r.since : r.last_active)]);
+    withAge && [' ', liveAgo(['waiting', 'running'].includes(r.status) ? r.since : r.last_active)]);
 }
 function titleLink(r) {
   return h('button', {class: 'title-link', title: openVerb(r), onclick: e => { e.stopPropagation(); openSession(r).catch(fail); }},
